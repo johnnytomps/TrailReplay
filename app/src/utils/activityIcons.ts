@@ -1,6 +1,10 @@
 import { createElement } from 'react';
 import type { CSSProperties, ReactElement } from 'react';
 
+export const PNG_ACTIVITY_ICON_VALUES = {
+  rafting: 'png-rafting'
+} as const;
+
 export const SVG_ACTIVITY_ICON_VALUES = {
   walking: 'svg-walking',
   running: 'svg-running',
@@ -13,13 +17,14 @@ export const DEFAULT_ACTIVITY_ICON = SVG_ACTIVITY_ICON_VALUES.walking;
 type ActivityIconOption = {
   value: string;
   labelKey: string;
-  kind: 'emoji' | 'svg';
+  kind: 'emoji' | 'svg' | 'png';
   content: string;
 };
 
 const svgIconBasePath = '/media/images/activity-icons';
 
 export const ACTIVITY_ICONS: ActivityIconOption[] = [
+  { value: PNG_ACTIVITY_ICON_VALUES.rafting, labelKey: 'rafting', kind: 'png', content: `${svgIconBasePath}/rafting.png` },
   { value: SVG_ACTIVITY_ICON_VALUES.walking, labelKey: 'activities.walking', kind: 'svg', content: `${svgIconBasePath}/walking.svg` },
   { value: SVG_ACTIVITY_ICON_VALUES.running, labelKey: 'activities.running', kind: 'svg', content: `${svgIconBasePath}/running.svg` },
   { value: SVG_ACTIVITY_ICON_VALUES.biking, labelKey: 'activities.cycling', kind: 'svg', content: `${svgIconBasePath}/biking.svg` },
@@ -107,6 +112,13 @@ export function renderActivityIcon(
     });
   }
 
+  if (icon?.kind === 'png') {
+    return createElement('img', {
+      className,
+      src: icon.content,
+    });
+  }
+
   return createElement(
     'span',
     {
@@ -131,6 +143,10 @@ export function getActivityIconMarkerHtml(value: string, size: number, color: st
 
   if (icon?.kind === 'svg') {
     return `<span aria-hidden="true" style="width:${size}px;height:${size}px;display:block;background-color:${escapeHtml(color)};mask-image:url('${escapeHtml(icon.content)}');mask-repeat:no-repeat;mask-position:center;mask-size:contain;-webkit-mask-image:url('${escapeHtml(icon.content)}');-webkit-mask-repeat:no-repeat;-webkit-mask-position:center;-webkit-mask-size:contain;position:relative;z-index:10;"></span>`;
+  }
+
+  if (icon?.kind === 'png') {
+    return `<span john="hi" aria-hidden="true" style="width:${size}px;height:${size}px;display:block;position:relative;z-index:10;"><img src="${escapeHtml(icon.content)}"></span>`;
   }
 
   return `<span style="width:${size}px;height:${size}px;display:inline-flex;align-items:center;justify-content:center;font-size:${size}px;line-height:1;position:relative;z-index:10;">${escapeHtml(icon?.content ?? value)}</span>`;
