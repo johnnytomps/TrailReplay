@@ -31,7 +31,7 @@ export function usePhotos() {
     const computedJourney = buildComputedJourney(journeySegments, tracks);
 
     if (computedJourney && computedJourney.coordinates.length > 0) {
-      return projectCoordinateToJourney(computedJourney, lat, lon, playback.progress);
+      return projectCoordinateToJourney(computedJourney, lat, lon, playback.progress, playback.routeTimingMode);
     }
 
     const candidateTracks = activeTrackId
@@ -46,7 +46,7 @@ export function usePhotos() {
     }
 
     return projectCoordinateToTracks(candidateTracks, lat, lon, playback.progress);
-  }, [activeTrackId, journeySegments, playback.progress, tracks]);
+  }, [activeTrackId, journeySegments, playback.progress, playback.routeTimingMode, tracks]);
 
   const processPhoto = useCallback(async (file: File): Promise<ProcessPhotoResult> => {
     const renderableAsset = await createRenderableImageAsset(file);
@@ -64,6 +64,7 @@ export function usePhotos() {
       journeySegments,
       computedJourney,
       activeTrackId,
+      routeTimingMode: playback.routeTimingMode,
     });
 
     return resolvePhotoPlacement({
@@ -78,7 +79,7 @@ export function usePhotos() {
       timestampFailureReason: timestampPlacement.reason,
       fallbackProgress: playback.progress,
     });
-  }, [activeTrackId, findPositionOnRoute, journeySegments, playback.progress, tracks]);
+  }, [activeTrackId, findPositionOnRoute, journeySegments, playback.progress, playback.routeTimingMode, tracks]);
 
   const addPhotos = useCallback(async (files: FileList | File[] | null) => {
     if (!files || files.length === 0) return;
@@ -97,12 +98,17 @@ export function usePhotos() {
       for (const file of imageFiles) {
         const result = await processPhoto(file);
         trackEvent('photo_import_file_processed', {
-          photo_file_name: file.name,
+          photo_has_gps: result.kind === 'picture'
+            ? result.picture.placementSource === 'gps'
+            : result.pendingPlacement.hasGpsMetadata ?? false,
+          photo_has_timestamp: result.kind === 'picture'
+            ? result.picture.timestamp !== undefined
+            : result.pendingPlacement.hasTimestampMetadata ?? false,
           photo_placement_result: result.kind === 'picture'
             ? (result.picture.placementSource ?? 'unknown')
             : 'pending',
           photo_manual_reason: result.kind === 'pending'
-            ? result.pendingPlacement.placementReason
+            ? result.pendingPlacement.placementReason.replaceAll('-', '_')
             : null,
         });
 

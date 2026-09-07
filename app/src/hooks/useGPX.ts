@@ -2,7 +2,10 @@ import { useCallback, useState } from 'react';
 import { parseGPXFiles } from '@/utils/gpxParser';
 import { useAppStore } from '@/store/useAppStore';
 import { useI18n } from '@/i18n/useI18n';
-import { trackEvent } from '@/utils/analytics';
+import { getDistanceBucket, trackEvent } from '@/utils/analytics';
+import { isReplayFile, useProjectFile } from '@/hooks/useProjectFile';
+
+export type RouteInputMethod = 'file_picker' | 'dropzone';
 
 export function useGPX() {
   const { t } = useI18n();
@@ -10,15 +13,27 @@ export function useGPX() {
   const [parseError, setParseError] = useState<string | null>(null);
   const addTrack = useAppStore((state) => state.addTrack);
   const setError = useAppStore((state) => state.setError);
+  const { openProjectFile } = useProjectFile();
 
-  const parseFiles = useCallback(async (files: FileList | null) => {
+  const parseFiles = useCallback(async (
+    files: FileList | File[] | null,
+    routeInputMethod: RouteInputMethod = 'file_picker',
+  ) => {
     if (!files || files.length === 0) return;
     const fileArray = Array.from(files);
-    
+
+    // A .replay file is a saved project, not a route — open it instead of parsing GPX/KML.
+    const replayFile = fileArray.find(isReplayFile);
+    if (replayFile) {
+      await openProjectFile(replayFile);
+      return undefined;
+    }
+
     setIsParsing(true);
     setParseError(null);
     trackEvent('route_import_started', {
       route_file_count: fileArray.length,
+      route_input_method: routeInputMethod,
     });
     
     try {
@@ -33,13 +48,26 @@ export function useGPX() {
       });
 
       trackEvent('route_import_completed', {
+        route_file_count: fileArray.length,
         route_imported_track_count: tracks.length,
+        route_import_is_multi_file: fileArray.length > 1,
+        route_input_method: routeInputMethod,
+        route_total_distance_bucket: getDistanceBucket(
+          tracks.reduce((total, track) => total + track.totalDistance, 0),
+        ),
+        route_has_timestamps: tracks.some((track) =>
+          track.points.some((point) => point.time !== null)
+        ),
       });
       
       return tracks;
     } catch (error) {
       trackEvent('route_import_failed', {
         route_file_count: fileArray.length,
+        route_input_method: routeInputMethod,
+        route_error_type: error instanceof Error && error.message === t('errors.noValidGpx')
+          ? 'empty_result'
+          : 'parse_error',
       });
       const message = error instanceof Error ? error.message : t('errors.parseGpxFailed');
       setParseError(message);
@@ -48,7 +76,7 @@ export function useGPX() {
     } finally {
       setIsParsing(false);
     }
-  }, [addTrack, setError, t]);
+  }, [addTrack, openProjectFile, setError, t]);
 
   return {
     parseFiles,

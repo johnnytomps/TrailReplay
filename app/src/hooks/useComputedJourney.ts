@@ -240,6 +240,32 @@ export function useComputedJourney() {
     return getAllJourneyCoordinates(computedJourney.coordinates);
   }, [computedJourney, activeTrack]);
 
+  // Camera prediction must follow replay time, not raw GPX point index. GPX
+  // samples are rarely spaced evenly, and journey segments can have independent
+  // durations. This normalized path gives one coordinate per equal replay-time
+  // step, using the same interpolation rules as the visible marker.
+  const cameraPathCoordinates = useMemo<number[][]>(() => {
+    const sampleCount = 601;
+
+    if (computedJourney) {
+      return Array.from({ length: sampleCount }, (_, index) => {
+        const progress = index / (sampleCount - 1);
+        const point = routeTimingMode === 'uniform' && journeyDistanceProfile
+          ? getJourneyPointAtDistance(journeyDistanceProfile, journeyDistanceProfile.totalDistance * progress)
+          : getJourneyPointAtProgress(progress, computedJourney.coordinates, computedJourney.segmentTimings);
+        return point ? [point.lon, point.lat] : [];
+      }).filter((coordinate) => coordinate.length === 2);
+    }
+
+    if (!activeTrack || activeTrack.points.length === 0) return [];
+
+    return Array.from({ length: sampleCount }, (_, index) => {
+      const progress = index / (sampleCount - 1);
+      const point = interpolateTrackPoint(activeTrack, activeTrack.totalDistance * progress);
+      return point ? [point.lon, point.lat] : [];
+    }).filter((coordinate) => coordinate.length === 2);
+  }, [activeTrack, computedJourney, journeyDistanceProfile, routeTimingMode]);
+
   // Get elevation data for elevation profile
   const elevationData = useMemo(() => {
     if (!computedJourney) {
@@ -257,9 +283,10 @@ export function useComputedJourney() {
 
     return getJourneyElevationData(
       computedJourney.coordinates,
-      computedJourney.segmentTimings
+      computedJourney.segmentTimings,
+      routeTimingMode
     );
-  }, [computedJourney, activeTrack]);
+  }, [computedJourney, activeTrack, routeTimingMode]);
 
   // Get the current icon based on segment type
   const currentIcon = useMemo<string>(() => {
@@ -297,6 +324,7 @@ export function useComputedJourney() {
     currentSegment,
     completedCoordinates,
     allCoordinates,
+    cameraPathCoordinates,
     elevationData,
     currentIcon,
     isInTransport,

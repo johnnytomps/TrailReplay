@@ -11,6 +11,9 @@ import {
 } from 'lucide-react';
 import { useI18n } from '@/i18n/useI18n';
 import { formatDuration } from '@/utils/units';
+import { getProgressBucket, trackEvent } from '@/utils/analytics';
+import { usePlaybackToggle } from '@/hooks/usePlaybackToggle';
+import { usePlayPauseShortcut } from '@/hooks/usePlayPauseShortcut';
 
 const SPEED_OPTIONS = [0.25, 0.5, 1, 2, 4, 8];
 
@@ -19,34 +22,69 @@ export function PlaybackControls() {
   const isMobile = useIsMobile();
   const playback = useAppStore((state) => state.playback);
   const play = useAppStore((state) => state.play);
-  const pause = useAppStore((state) => state.pause);
   const seekToProgress = useAppStore((state) => state.seekToProgress);
   const setSpeed = useAppStore((state) => state.setSpeed);
+  const tracks = useAppStore((state) => state.tracks);
+  const pictures = useAppStore((state) => state.pictures);
+  const textAnnotations = useAppStore((state) => state.textAnnotations);
+  const cameraSettings = useAppStore((state) => state.cameraSettings);
+  const mapStyle = useAppStore((state) => state.settings.mapStyle);
+  const show3DTerrain = useAppStore((state) => state.settings.show3DTerrain);
   
   const handleSliderChange = useCallback((value: number[]) => {
     seekToProgress(value[0] / 100);
   }, [seekToProgress]);
+
+  const trackSeek = (
+    method: 'slider' | 'skip_forward' | 'skip_backward' | 'restart',
+    progress = playback.progress,
+  ) => {
+    trackEvent('playback_seeked', {
+      seek_method: method,
+      playback_progress_bucket: getProgressBucket(progress * 100),
+    });
+  };
   
   const skipForward = () => {
-    seekToProgress(Math.min(playback.progress + 0.05, 1));
+    const nextProgress = Math.min(playback.progress + 0.05, 1);
+    seekToProgress(nextProgress);
+    trackSeek('skip_forward', nextProgress);
   };
   
   const skipBackward = () => {
-    seekToProgress(Math.max(playback.progress - 0.05, 0));
+    const nextProgress = Math.max(playback.progress - 0.05, 0);
+    seekToProgress(nextProgress);
+    trackSeek('skip_backward', nextProgress);
   };
   
   const restart = () => {
     seekToProgress(0);
     play();
+    trackSeek('restart', 0);
+    trackEvent('playback_started', {
+      playback_source: 'restart_button',
+      has_pictures: pictures.length > 0,
+      has_annotations: textAnnotations.length > 0,
+      track_count: tracks.length,
+      camera_mode: cameraSettings.mode,
+      camera_preset: cameraSettings.mode === 'follow-behind' ? cameraSettings.followBehindPreset : 'not_applicable',
+      map_style: mapStyle,
+      terrain_3d_enabled: show3DTerrain,
+    });
   };
+
+  const togglePlayback = usePlaybackToggle();
+
+  // Space does the same thing from anywhere on the page.
+  usePlayPauseShortcut();
 
   return (
     <div className="h-full flex items-center gap-2 sm:gap-4 px-2 sm:px-4 min-w-0">
       {/* Time Display */}
       <div className={`flex-shrink-0 text-sm font-mono text-[var(--evergreen)] ${isMobile ? 'hidden' : ''}`}>
-        <span className="font-bold">{formatDuration(playback.currentTime / 1000)}</span>
+        <span className="font-bold">{formatDuration(playback.currentTime / 1000 / playback.speed)}</span>
         <span className="text-[var(--evergreen-60)] mx-1">/</span>
-        <span className="text-[var(--evergreen-60)]">{formatDuration(playback.totalDuration / 1000)}</span>
+        <span className="text-[var(--evergreen-60)]">{formatDuration(playback.totalDuration / 1000 / playback.speed)}</span>
       </div>
       
       {/* Progress Slider */}
@@ -54,6 +92,7 @@ export function PlaybackControls() {
         <Slider
           value={[playback.progress * 100]}
           onValueChange={handleSliderChange}
+          onValueCommit={(value) => trackSeek('slider', value[0] / 100)}
           max={100}
           step={0.1}
           className="w-full"
@@ -67,7 +106,11 @@ export function PlaybackControls() {
           {SPEED_OPTIONS.map((speed) => (
             <button
               key={speed}
-              onClick={() => setSpeed(speed)}
+              onClick={() => {
+                if (playback.speed === speed) return;
+                setSpeed(speed);
+                trackEvent('playback_speed_changed', { playback_speed: speed });
+              }}
               className={`
                 px-2 py-1 text-xs font-medium rounded transition-colors
                 ${playback.speed === speed
@@ -103,7 +146,7 @@ export function PlaybackControls() {
         
         {/* Play/Pause */}
         <button
-          onClick={playback.isPlaying ? pause : play}
+          onClick={() => togglePlayback('play_button')}
           className="tr-playback-btn shrink-0"
           style={isMobile ? { width: '48px', height: '48px' } : undefined}
           aria-label={playback.isPlaying ? t('playback.pause') : t('playback.play')}

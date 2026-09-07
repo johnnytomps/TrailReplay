@@ -3,6 +3,9 @@ import { interpolateTrackPoint } from '@/utils/gpx/interpolateTrackPoint';
 import { parseGpxDocument } from '@/utils/gpx/parseGpxDocument';
 import { parseKmlDocument } from '@/utils/gpx/parseKmlDocument';
 import { buildTrackFromRawPoints } from '@/utils/gpx/trackStats';
+import { serializeTrackToGpx } from '@/utils/gpx/serializeTrackToGpx';
+
+export { serializeTrackToGpx };
 
 // Parse GPX XML content
 export function parseGPX(gpxContent: string, fileName: string): GPXTrack {
@@ -31,8 +34,9 @@ export async function parseGPXFiles(files: File[]): Promise<GPXTrack[]> {
   const tracks: GPXTrack[] = [];
 
   for (const file of files) {
-    const isGPX = file.name.endsWith('.gpx');
-    const isKML = file.name.endsWith('.kml');
+    const extension = getSupportedRouteFileExtension(file.name);
+    const isGPX = extension === 'gpx';
+    const isKML = extension === 'kml';
 
     if (!isGPX && !isKML) continue;
 
@@ -48,6 +52,11 @@ export async function parseGPXFiles(files: File[]): Promise<GPXTrack[]> {
   }
 
   return tracks;
+}
+
+function getSupportedRouteFileExtension(fileName: string): 'gpx' | 'kml' | null {
+  const extension = fileName.split('.').pop()?.toLowerCase();
+  return extension === 'gpx' || extension === 'kml' ? extension : null;
 }
 
 // Get point at a specific distance along the track

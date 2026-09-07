@@ -3,6 +3,7 @@ import { useAppStore } from '@/store/useAppStore';
 import { useComputedJourney } from '@/hooks/useComputedJourney';
 import { convertElevation } from '@/utils/units';
 import type { CropPreviewMetrics } from '@/utils/crop';
+import { getElevationAtProgress } from './elevationProfile';
 
 interface MapElevationProfileProps {
   className?: string;
@@ -17,7 +18,8 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
   const tracks = useAppStore((state) => state.tracks);
   const isExporting = useAppStore((state) => state.isExporting);
   const activePanel = useAppStore((state) => state.activePanel);
-  const exportAspectRatio = useAppStore((state) => state.videoExportSettings.aspectRatio);
+  const videoExportSettings = useAppStore((state) => state.videoExportSettings);
+  const exportAspectRatio = videoExportSettings.aspectRatio;
 
   // Use computed journey for multi-track support
   const {
@@ -26,7 +28,13 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
     currentTrackColor,
     isInTransport,
     currentSegment,
+    routeTimingMode,
   } = useComputedJourney();
+
+  const segmentProgressRange = (timing: typeof segmentTimings[number]) => ({
+    start: routeTimingMode === 'uniform' ? timing.distanceStartRatio : timing.progressStartRatio,
+    end: routeTimingMode === 'uniform' ? timing.distanceEndRatio : timing.progressEndRatio,
+  });
 
   // Generate elevation profile data
   const profileData = useMemo(() => {
@@ -75,13 +83,6 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
       };
     });
 
-    // Create path for elevation profile (filled area from bottom)
-    let pathD = `M 0 ${svgHeight}`;
-    normalizedPoints.forEach((point) => {
-      pathD += ` L ${point.x} ${point.y}`;
-    });
-    pathD += ` L ${svgWidth} ${svgHeight} Z`;
-
     // Create segment paths with different colors
     const segmentPaths: Array<{
       pathD: string;
@@ -89,11 +90,19 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
       segmentIndex: number;
       type: 'track' | 'transport';
     }> = [];
+    const pointsBySegment = new Map<number, typeof normalizedPoints>();
+
+    normalizedPoints.forEach((point) => {
+      const points = pointsBySegment.get(point.segmentIndex) ?? [];
+      points.push(point);
+      pointsBySegment.set(point.segmentIndex, points);
+    });
 
     segmentTimings.forEach((timing) => {
-      const segmentPoints = normalizedPoints.filter(
-        (p) => p.progress >= timing.progressStartRatio && p.progress <= timing.progressEndRatio
-      );
+      // Segment progress can share an exact boundary with the adjacent file.
+      // Select by ownership, rather than by the boundary range, so separate
+      // routes never become a fictitious climb or descent in the profile.
+      const segmentPoints = pointsBySegment.get(timing.segmentIndex) ?? [];
 
       if (segmentPoints.length > 1) {
         let segPathD = `M ${segmentPoints[0].x} ${svgHeight}`;
@@ -123,24 +132,22 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
     });
 
     return {
-      pathD,
-      minElevation,
-      maxElevation,
       svgWidth,
       svgHeight,
-      normalizedPoints,
+      pointsBySegment,
       segmentPaths,
     };
   }, [elevationData, segmentTimings, trailStyle.trailColor, tracks]);
 
-  // Calculate progress path (filled area showing progress)
+  // Only the clip width and interpolated label change during playback. The
+  // profile paths themselves stay static, avoiding a full GPX scan and a large
+  // SVG `d` string rebuild on every animation frame.
   const progressData = useMemo(() => {
     if (!profileData || playback.progress <= 0) {
-      return { pathD: '', currentElevation: 0, markerX: 0, markerY: 0, currentColor: trailStyle.trailColor };
+      return { currentElevation: 0, markerX: 0, currentColor: trailStyle.trailColor };
     }
 
-    const { svgWidth, svgHeight, normalizedPoints } = profileData;
-    const progressIndex = Math.floor(playback.progress * (normalizedPoints.length - 1));
+    const { svgWidth, pointsBySegment } = profileData;
     const progressX = playback.progress * svgWidth;
 
     // Find the current segment's color
@@ -149,45 +156,35 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
       currentColor = '#888888';
     }
 
-    let pathD = `M 0 ${svgHeight}`;
-
-    // Add points up to current progress
-    for (let i = 0; i <= progressIndex && i < normalizedPoints.length; i++) {
-      pathD += ` L ${normalizedPoints[i].x} ${normalizedPoints[i].y}`;
+    let currentPoints = currentSegment
+      ? pointsBySegment.get(currentSegment.segment.segmentIndex)
+      : undefined;
+    if (!currentPoints) {
+      currentPoints = [...pointsBySegment.values()].find((points) => {
+        const first = points[0];
+        const last = points[points.length - 1];
+        return first && last && playback.progress >= first.progress && playback.progress <= last.progress;
+      });
     }
 
-    // Interpolate to exact progress position if between points
-    let markerY = svgHeight;
-    let currentElevation = 0;
+    const currentElevation = currentPoints
+      ? getElevationAtProgress(currentPoints, playback.progress)
+      : 0;
 
-    if (progressIndex < normalizedPoints.length - 1) {
-      const currentPoint = normalizedPoints[progressIndex];
-      const nextPoint = normalizedPoints[progressIndex + 1];
-      const localProgress = (playback.progress * (normalizedPoints.length - 1)) - progressIndex;
-      const interpolatedY = currentPoint.y + (nextPoint.y - currentPoint.y) * localProgress;
-      pathD += ` L ${progressX} ${interpolatedY}`;
-      markerY = interpolatedY;
-      currentElevation = currentPoint.elevation + (nextPoint.elevation - currentPoint.elevation) * localProgress;
-    } else if (progressIndex < normalizedPoints.length) {
-      markerY = normalizedPoints[progressIndex].y;
-      currentElevation = normalizedPoints[progressIndex].elevation;
-    }
+    return { currentElevation, markerX: progressX, currentColor };
+  }, [profileData, playback.progress, currentTrackColor, trailStyle.trailColor, isInTransport, currentSegment]);
 
-    // Close the path
-    pathD += ` L ${progressX} ${svgHeight} Z`;
-
-    return { pathD, currentElevation, markerX: progressX, markerY, currentColor };
-  }, [profileData, playback.progress, currentTrackColor, trailStyle.trailColor, isInTransport]);
-
-  // Don't show during intro/outro animations
-  const shouldShow = profileData && (animationPhase === 'idle' || animationPhase === 'playing');
+  // The Style setting is the single source of truth for both preview and export.
+  const shouldShow = profileData &&
+    settings.showElevationProfile &&
+    (animationPhase === 'idle' || animationPhase === 'playing');
 
   if (!shouldShow) {
     return null;
   }
 
   const { svgWidth, svgHeight, segmentPaths } = profileData;
-  const { pathD: progressPathD, currentElevation, markerX, currentColor } = progressData;
+  const { currentElevation, markerX, currentColor } = progressData;
   const elevUnit = settings.unitSystem === 'metric' ? 'm' : 'ft';
 
   const formattedCurrentElev = Math.round(convertElevation(currentElevation, settings.unitSystem));
@@ -225,6 +222,7 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
           preserveAspectRatio="none"
           className={`w-full ${isNonWideExportPreview ? 'h-[72px]' : 'h-[60px]'}`}
           id="elevationProfileSvg"
+          data-export-elevation-progress-color={currentColor}
         >
           {/* Gradient definitions for segments */}
           <defs>
@@ -245,6 +243,9 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
               <stop offset="0%" stopColor={currentColor} stopOpacity="0.9" />
               <stop offset="100%" stopColor={currentColor} stopOpacity="0.5" />
             </linearGradient>
+            <clipPath id="elevationProgressClip">
+              <rect x="0" y="0" width={markerX} height={svgHeight} />
+            </clipPath>
           </defs>
 
           {/* Background elevation profiles for each segment */}
@@ -252,6 +253,8 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
             <path
               key={`segment-${seg.segmentIndex}`}
               d={seg.pathD}
+              data-export-elevation-segment
+              data-export-elevation-color={seg.color}
               fill={`url(#segmentGradient-${seg.segmentIndex})`}
               stroke={seg.color}
               strokeWidth="1"
@@ -262,34 +265,43 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
           ))}
 
           {/* Progress overlay */}
-          {progressPathD && (
-            <path
-              d={progressPathD}
-              fill="url(#progressGradient)"
-              stroke={currentColor}
-              strokeWidth="2"
-              id="progressPath"
-            />
+          {playback.progress > 0 && (
+            <g clipPath="url(#elevationProgressClip)" data-export-elevation-dynamic>
+              {segmentPaths.map((seg) => (
+                <path
+                  key={`progress-${seg.segmentIndex}`}
+                  d={seg.pathD}
+                  fill="url(#progressGradient)"
+                  stroke={currentColor}
+                  strokeWidth="2"
+                />
+              ))}
+            </g>
           )}
 
           {/* Segment boundaries (vertical lines) */}
-          {segmentTimings.length > 1 && segmentTimings.slice(1).map((timing, i) => (
-            <line
-              key={`boundary-${i}`}
-              x1={timing.progressStartRatio * svgWidth}
-              y1="0"
-              x2={timing.progressStartRatio * svgWidth}
-              y2={svgHeight}
-              stroke="white"
-              strokeWidth="1"
-              strokeOpacity="0.3"
-            />
-          ))}
+          {segmentTimings.length > 1 && segmentTimings.slice(1).map((timing, i) => {
+            const { start } = segmentProgressRange(timing);
+            return (
+              <line
+                key={`boundary-${i}`}
+                x1={start * svgWidth}
+                y1="0"
+                x2={start * svgWidth}
+                y2={svgHeight}
+                stroke="white"
+                strokeWidth="1"
+                strokeOpacity="0.3"
+              />
+            );
+          })}
         </svg>
 
         {/* Current elevation label - follows the progress, aligned to bottom */}
         {playback.progress > 0 && (
           <div
+            data-export-elevation-dynamic
+            data-export-elevation-label
             className={`absolute transform -translate-x-1/2 whitespace-nowrap ${
               isNonWideExportPreview
                 ? 'bottom-2'
@@ -343,8 +355,9 @@ export function MapElevationProfile({ className = '', exportFrame = null }: MapE
         {segmentTimings.length > 1 && (
           <div className="absolute top-0 left-0 right-0 flex">
             {segmentTimings.map((timing, i) => {
-              const width = (timing.progressEndRatio - timing.progressStartRatio) * 100;
-              const left = timing.progressStartRatio * 100;
+              const { start, end } = segmentProgressRange(timing);
+              const width = (end - start) * 100;
+              const left = start * 100;
               const track = timing.trackId ? tracks.find((t) => t.id === timing.trackId) : null;
 
               return (

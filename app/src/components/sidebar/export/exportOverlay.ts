@@ -15,7 +15,15 @@ type Rect = {
 export type ExportOverlayMetrics = ReturnType<typeof getExportOverlayMetrics>;
 
 export function getOverlayRefreshIntervalMs(fps: number) {
-  return Math.max(21, Math.round(1000 / Math.min(fps * 2, 48)));
+  // Re-capturing the DOM overlay is considerably more expensive than drawing
+  // the map frame. A 12 fps cadence keeps the elevation marker readable while
+  // avoiding a distracting per-frame redraw in the exported video.
+  return Math.max(83, Math.round(1000 / Math.min(fps, 12)));
+}
+
+export function getStatsValueTimelineBucket(currentTimeMs: number) {
+  const safeTime = Number.isFinite(currentTimeMs) ? Math.max(0, currentTimeMs) : 0;
+  return Math.floor(safeTime / 100);
 }
 
 export function getExportOverlayMetrics(
@@ -48,20 +56,46 @@ export function getCapturedCanvasDrawSize(
 
 export function getStatsOverlayDrawRect(params: {
   captureCanvas: Size;
+  /** Scale used only for width/height computation (pass 1 when width is already pre-scaled). */
   scaleToRecording: number;
+  /** Scale used to convert screen-pixel position → recording-pixel position. */
+  positionScale?: number;
   recordW: number;
   recordH: number;
   margin: number;
+  /** When provided, the stats are drawn at the element's actual screen position. */
+  elementRect?: { left: number; top: number };
+  containerRect?: { left: number; top: number };
+  cropX?: number;
+  cropY?: number;
+  /** User-selected visual scale for the complete stats block. */
+  sizeScale?: number;
 }) {
-  const rawWidth = params.captureCanvas.width * params.scaleToRecording;
+  const sizeScale = Number.isFinite(params.sizeScale)
+    ? Math.max(0.6, Math.min(2, params.sizeScale ?? 1))
+    : 1;
+  const rawWidth = params.captureCanvas.width * params.scaleToRecording * sizeScale;
   const isNarrowFrame = params.recordW <= params.recordH;
   const maxWidth = Math.min(
     rawWidth,
     params.recordW - (params.margin * 2),
-    params.recordW * (isNarrowFrame ? 0.56 : 0.28),
+    params.recordW * (isNarrowFrame ? 0.56 : 0.28) * Math.max(1, sizeScale),
   );
   const drawWidth = Math.max(0, maxWidth);
   const drawHeight = params.captureCanvas.height * (drawWidth / params.captureCanvas.width);
+
+  // Mirror the element's actual DOM position into video coordinates.
+  if (params.elementRect && params.containerRect && params.cropX !== undefined && params.cropY !== undefined) {
+    const posScale = params.positionScale ?? params.scaleToRecording;
+    const drawX = (params.elementRect.left - params.containerRect.left - params.cropX) * posScale;
+    const drawY = (params.elementRect.top - params.containerRect.top - params.cropY) * posScale;
+    return {
+      drawX: Math.max(0, drawX),
+      drawY: Math.max(0, drawY),
+      drawWidth,
+      drawHeight,
+    };
+  }
 
   return {
     drawX: isNarrowFrame ? (params.recordW - drawWidth) / 2 : params.margin,
@@ -87,6 +121,33 @@ export function getElevationOverlayDrawRect(params: {
     drawY: params.recordH - drawHeight - params.margin,
     drawWidth,
     drawHeight,
+  };
+}
+
+/**
+ * The popup's `<img>` is styled `object-fit: contain` so the whole photo
+ * stays visible regardless of its aspect ratio vs. its box — the element's
+ * own bounding box is still the *full* box, though, not the letterboxed
+ * content within it. Drawing straight into `popupRect` (as
+ * `getPopupOverlayDrawRect` does) stretches the natural image to fill that
+ * full box, ignoring its aspect ratio, so exported photos looked squashed/
+ * stretched. This re-derives the same contain-fitted sub-rect the browser
+ * computes for `object-fit: contain`, so the "crisp" redraw matches what's
+ * actually visible on screen.
+ */
+export function getObjectContainRect(box: Rect, naturalWidth: number, naturalHeight: number): Rect {
+  if (naturalWidth <= 0 || naturalHeight <= 0 || box.width <= 0 || box.height <= 0) return box;
+
+  const boxAspect = box.width / box.height;
+  const imageAspect = naturalWidth / naturalHeight;
+  const width = imageAspect > boxAspect ? box.width : box.height * imageAspect;
+  const height = imageAspect > boxAspect ? box.width / imageAspect : box.height;
+
+  return {
+    left: box.left + (box.width - width) / 2,
+    top: box.top + (box.height - height) / 2,
+    width,
+    height,
   };
 }
 

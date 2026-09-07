@@ -4,23 +4,30 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useAppStore } from '@/store/useAppStore';
 import { useComputedJourney } from '@/hooks/useComputedJourney';
+import { usePreparedCinematicCameraKeyframes } from '@/hooks/useCinematicCameraKeyframes';
+import { useSuggestedFollowBehindDistance } from '@/components/map/hooks/useSuggestedFollowBehindDistance';
 import { MapElevationProfile } from './MapElevationProfile';
 import { useI18n } from '@/i18n/useI18n';
 import { MAP_LAYERS } from './mapStyle';
 import {
-  getFollowBehindCameraTarget,
-  getFollowBehindZoomLevelFromZoom,
+  getFollowBehindLevelForStopIndex,
+  getFollowBehindStopIndexForLevel,
   getNearestFollowBehindPreset,
 } from '@/utils/followBehindCamera';
 import { useManualPicturePlacement } from './hooks/useManualPicturePlacement';
 import { usePictureMarkers } from './hooks/usePictureMarkers';
 import { useTextAnnotationsLayer } from './hooks/useTextAnnotationsLayer';
+import { useRouteLandmarksLayer } from './hooks/useRouteLandmarksLayer';
+import { useRouteLandmarks } from '@/hooks/useRouteLandmarks';
 import { useComparisonTrackLayers } from './hooks/useComparisonTrackLayers';
 import { useBaseMapPresentation } from './hooks/useBaseMapPresentation';
 import { useMapInitialization } from './hooks/useMapInitialization';
 import { useTrailLayerData } from './hooks/useTrailLayerData';
 import { useTrailPlaybackCamera } from './hooks/useTrailPlaybackCamera';
+import { useCameraTerrainClearance } from './hooks/useCameraTerrainClearance';
 import { useTilePreload } from './hooks/useTilePreload';
+import { useReplayTileWarmup } from './hooks/useReplayTileWarmup';
+import { useTilePreloadDiagnostics } from './hooks/useTilePreloadDiagnostics';
 import { projectCoordinateToJourney, projectCoordinateToTrack } from '@/utils/routeProjection';
 import type { CropPreviewMetrics } from '@/utils/crop';
 
@@ -32,7 +39,6 @@ interface TrailMapProps {
 }
 
 const ZOOM_BUTTON_HINT_STORAGE_KEY = 'trailreplay-follow-behind-zoom-buttons-hint-seen';
-const ZOOM_BUTTON_STEP = 1;
 
 export function TrailMap(_props: TrailMapProps) {
   const { t } = useI18n();
@@ -44,9 +50,8 @@ export function TrailMap(_props: TrailMapProps) {
   const markerRef = useRef<maplibregl.Marker | null>(null);
   const smoothBearingRef = useRef<number>(0);
   const targetBearingRef = useRef<number>(0);
-  const introZoomTriggeredRef = useRef<boolean>(false);
-  const lastAnimationPhaseRef = useRef<string>('idle');
   const loadZoomDoneRef = useRef<boolean>(false);
+  const handledZoomButtonPressRef = useRef(false);
 
   const tracks = useAppStore((state) => state.tracks);
   const settings = useAppStore((state) => state.settings);
@@ -65,6 +70,7 @@ export function TrailMap(_props: TrailMapProps) {
   const addPicture = useAppStore((state) => state.addPicture);
   const removePendingPicturePlacement = useAppStore((state) => state.removePendingPicturePlacement);
   const comparisonTracks = useAppStore((state) => state.comparisonTracks);
+  const landmarks = useRouteLandmarks();
 
   const [isMapLoaded, setIsMapLoaded] = useState(false);
   const [showZoomButtonsHint, setShowZoomButtonsHint] = useState(false);
@@ -80,17 +86,18 @@ export function TrailMap(_props: TrailMapProps) {
   // Use the computed journey hook for multi-track support
   const {
     currentPosition,
-    currentBearing,
     currentIcon,
     currentSegment,
     completedCoordinates,
     allCoordinates,
+    cameraPathCoordinates,
     isInTransport,
     currentTrackColor,
     segmentTimings,
     elevationData,
     activeTrack,
     computedJourney,
+    totalDistance,
   } = useComputedJourney();
 
   // Derive the current track name for the label
@@ -99,6 +106,15 @@ export function TrailMap(_props: TrailMapProps) {
     : activeTrack?.name;
   const cameraMode = cameraSettings.mode;
   const followBehindZoomLevel = cameraSettings.followBehindZoomLevel;
+  const cinematicKeyframes = usePreparedCinematicCameraKeyframes(cameraPathCoordinates);
+
+  useSuggestedFollowBehindDistance({
+    allCoordinates,
+    followBehindZoomLevel,
+    setCameraSettings,
+    totalDistanceMeters: totalDistance,
+    totalDurationMs: playback.totalDuration,
+  });
   const handleMapLoadedChange = useCallback((isLoaded: boolean) => {
     setIsMapLoaded(isLoaded);
     if (!isLoaded) {
@@ -143,6 +159,8 @@ export function TrailMap(_props: TrailMapProps) {
     unitSystem: settings.unitSystem,
   });
 
+  useRouteLandmarksLayer({ isMapLoaded, landmarks, mapRef: map });
+
   useComparisonTrackLayers({
     comparisonTracks,
     isMapLoaded,
@@ -152,7 +170,6 @@ export function TrailMap(_props: TrailMapProps) {
 
   useBaseMapPresentation({
     currentTrackColor: currentTrackColor ?? null,
-    currentTrackName: currentTrackName ?? null,
     isMapLoaded,
     mapRef: map,
     settings,
@@ -169,13 +186,13 @@ export function TrailMap(_props: TrailMapProps) {
   useTrailLayerData({
     activeTrack,
     allCoordinates,
-    animationPhase,
     colorMode: trailStyle.colorMode,
+    colorZones: trailStyle.colorZones,
     computedJourney,
+    isExporting,
     isMapLoaded,
     loadZoomDoneRef,
     mapRef: map,
-    playbackProgress: playback.progress,
     segmentTimings,
     trailColor: trailStyle.trailColor,
   });
@@ -183,22 +200,24 @@ export function TrailMap(_props: TrailMapProps) {
   useTrailPlaybackCamera({
     activeTrack,
     allCoordinates,
+    cameraCoordinates: cameraPathCoordinates,
     animationPhase,
     cameraMode,
+    cameraStability: cameraSettings.cameraStability,
+    cinematicKeyframes,
     completedCoordinates,
     computedJourney,
-    currentBearing,
     currentIcon,
+    currentTimeMs: playback.currentTime,
     currentPosition,
     currentSegment,
     currentTrackColor: currentTrackColor ?? null,
     currentTrackName: currentTrackName ?? null,
     elevationData,
     followBehindZoomLevel,
-    introZoomTriggeredRef,
+    isExporting,
     isInTransport,
     isMapLoaded,
-    lastAnimationPhaseRef,
     mapRef: map,
     markerRef,
     playbackProgress: playback.progress,
@@ -206,11 +225,14 @@ export function TrailMap(_props: TrailMapProps) {
     setCameraPosition,
     smoothBearingRef,
     targetBearingRef,
+    totalDurationMs: playback.totalDuration,
     trailStyle: {
       colorMode: trailStyle.colorMode,
+      colorZones: trailStyle.colorZones,
       currentIcon: trailStyle.currentIcon,
       markerColor: trailStyle.markerColor,
       markerSize: trailStyle.markerSize,
+      markerType: trailStyle.markerType,
       showCircle: trailStyle.showCircle,
       showMarker: trailStyle.showMarker,
       showTrackLabels: trailStyle.showTrackLabels,
@@ -218,9 +240,18 @@ export function TrailMap(_props: TrailMapProps) {
     },
   });
 
+  // Applies in every camera mode, and to manual navigation as much as to the
+  // replay: whatever moves the camera, it does not end up underground.
+  useCameraTerrainClearance({
+    isMapLoaded,
+    mapRef: map,
+    show3DTerrain: settings.show3DTerrain,
+  });
+
   useTilePreload({
-    allCoordinates,
+    allCoordinates: cameraPathCoordinates,
     animationPhase,
+    cameraMode,
     elevationData,
     followBehindZoomLevel,
     isMapLoaded,
@@ -229,6 +260,28 @@ export function TrailMap(_props: TrailMapProps) {
     setAnimationPhase,
     smoothBearingRef,
     targetBearingRef,
+    totalDurationMs: playback.totalDuration,
+  });
+
+  const tileDiagnostics = useTilePreloadDiagnostics({
+    isMapLoaded,
+    isPlaying: playback.isPlaying,
+    mapRef: map,
+  });
+
+  useReplayTileWarmup({
+    allCoordinates: cameraPathCoordinates,
+    animationPhase,
+    cameraMode,
+    diagnostics: tileDiagnostics,
+    elevationData,
+    followBehindZoomLevel,
+    isMapLoaded,
+    isPlaying: playback.isPlaying,
+    mapStyle: settings.mapStyle,
+    playbackProgress: playback.progress,
+    playbackSpeed: playback.speed,
+    totalDurationMs: playback.totalDuration,
   });
 
   useEffect(() => {
@@ -242,53 +295,85 @@ export function TrailMap(_props: TrailMapProps) {
       return;
     }
 
-    const interceptZoomButton = (event: Event, direction: 1 | -1) => {
+    const changeFollowBehindDistance = (event: Event, direction: 1 | -1) => {
       const isAnimating = animationPhase === 'intro' || animationPhase === 'playing';
-      if (cameraMode !== 'follow-behind' || !isAnimating) return;
+      if (cameraMode !== 'follow-behind' || !isAnimating) return false;
 
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation?.();
 
-      const currentZoom = map.current?.getZoom()
-        ?? getFollowBehindCameraTarget(followBehindZoomLevel, 'playback').zoom;
-      const nextLevel = getFollowBehindZoomLevelFromZoom(
-        currentZoom + (direction * ZOOM_BUTTON_STEP),
-        'playback',
-      );
+      // Step through the distance stops the slider exposes, from the saved
+      // level rather than the map's live zoom: terrain safety can temporarily
+      // zoom the camera out, and deriving from that made a button press appear
+      // to do nothing or jump to the wrong distance.
+      const currentIndex = getFollowBehindStopIndexForLevel(followBehindZoomLevel);
+      const nextLevel = getFollowBehindLevelForStopIndex(currentIndex + direction);
+      if (nextLevel === followBehindZoomLevel) return true;
 
       setCameraSettings({
         followBehindPreset: getNearestFollowBehindPreset(nextLevel),
         followBehindZoomLevel: nextLevel,
       });
+      return true;
     };
 
-    const handleZoomInClick = (event: Event) => interceptZoomButton(event, 1);
-    const handleZoomOutClick = (event: Event) => interceptZoomButton(event, -1);
+    const handleZoomButtonPress = (event: Event, direction: 1 | -1) => {
+      handledZoomButtonPressRef.current = changeFollowBehindDistance(event, direction);
+    };
+    const handleZoomButtonClick = (event: Event, direction: 1 | -1) => {
+      if (handledZoomButtonPressRef.current) {
+        handledZoomButtonPressRef.current = false;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        return;
+      }
+      changeFollowBehindDistance(event, direction);
+    };
 
+    const handleZoomInPress = (event: Event) => handleZoomButtonPress(event, 1);
+    const handleZoomOutPress = (event: Event) => handleZoomButtonPress(event, -1);
+    const handleZoomInClick = (event: Event) => handleZoomButtonClick(event, 1);
+    const handleZoomOutClick = (event: Event) => handleZoomButtonClick(event, -1);
+
+    zoomInButton.addEventListener('mousedown', handleZoomInPress, true);
+    zoomOutButton.addEventListener('mousedown', handleZoomOutPress, true);
+    zoomInButton.addEventListener('touchstart', handleZoomInPress, true);
+    zoomOutButton.addEventListener('touchstart', handleZoomOutPress, true);
     zoomInButton.addEventListener('click', handleZoomInClick, true);
     zoomOutButton.addEventListener('click', handleZoomOutClick, true);
 
     return () => {
+      zoomInButton.removeEventListener('mousedown', handleZoomInPress, true);
+      zoomOutButton.removeEventListener('mousedown', handleZoomOutPress, true);
+      zoomInButton.removeEventListener('touchstart', handleZoomInPress, true);
+      zoomOutButton.removeEventListener('touchstart', handleZoomOutPress, true);
       zoomInButton.removeEventListener('click', handleZoomInClick, true);
       zoomOutButton.removeEventListener('click', handleZoomOutClick, true);
     };
   }, [animationPhase, cameraMode, followBehindZoomLevel, isMapLoaded, setCameraSettings]);
 
   useEffect(() => {
-    if (isMobile || cameraMode !== 'follow-behind' || hasSeenZoomButtonsHint) return;
+    if (!isMobile || cameraMode !== 'follow-behind' || hasSeenZoomButtonsHint) return;
 
     const isAnimating = animationPhase === 'intro' || animationPhase === 'playing';
     if (!isAnimating) return;
 
-    setShowZoomButtonsHint(true);
-    setHasSeenZoomButtonsHint(true);
+    // Deferring this presentation update prevents a render cascade when playback
+    // enters its active phase, while still showing the hint before the next paint.
+    const timeoutId = window.setTimeout(() => {
+      setShowZoomButtonsHint(true);
+      setHasSeenZoomButtonsHint(true);
+    }, 0);
 
     try {
       window.localStorage.setItem(ZOOM_BUTTON_HINT_STORAGE_KEY, '1');
     } catch {
       // Ignore storage failures; the hint will just reappear on the next load.
     }
+
+    return () => window.clearTimeout(timeoutId);
   }, [animationPhase, cameraMode, hasSeenZoomButtonsHint, isMobile]);
 
   useEffect(() => {
@@ -325,7 +410,7 @@ export function TrailMap(_props: TrailMapProps) {
         </div>
       )}
 
-      {!isMobile && showZoomButtonsHint && isMapLoaded && allCoordinates.length > 0 && (
+      {isMobile && showZoomButtonsHint && isMapLoaded && allCoordinates.length > 0 && (
         <div className="absolute right-4 top-20 z-20 max-w-56 rounded-2xl border border-white/12 bg-[rgba(9,14,19,0.88)] px-3 py-2.5 text-xs leading-relaxed text-white shadow-[0_16px_36px_rgba(0,0,0,0.28)] backdrop-blur-sm">
           {t('map.zoomButtonsHint')}
         </div>

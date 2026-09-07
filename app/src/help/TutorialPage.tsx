@@ -2,6 +2,7 @@ import { BookOpen, Download, Film, ImageIcon, Layers3, Mountain, Route, TimerRes
 import { useI18n } from '@/i18n/useI18n';
 import { HelpLayout } from './HelpLayout';
 import { getQuickStartSteps, getSampleTracks, getTutorialFeatures, getTutorialVideos } from './helpContent';
+import { trackEvent } from '@/utils/analytics';
 
 const featureIcons = [Route, Layers3, ImageIcon, Mountain, Film, TimerReset];
 
@@ -19,7 +20,7 @@ export function TutorialPage() {
       description={t('help.tutorial.description')}
       headerActions={[
         {
-          href: '/gpx-download-guide.html',
+          href: '/gpx-download-guide',
           icon: <Download className="h-3.5 w-3.5" />,
           label: t('help.tutorial.headerAction'),
           tone: 'solid',
@@ -71,7 +72,14 @@ export function TutorialPage() {
               </a>
             ))}
           </div>
-          <a href="/gpx-download-guide.html" className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-[var(--trail-orange)] hover:underline">
+          <a
+            href="/gpx-download-guide"
+            onClick={() => trackEvent('help_cta_clicked', {
+              cta_location: 'tutorial',
+              target_page: 'gpx_guide',
+            })}
+            className="mt-5 inline-flex items-center gap-2 text-sm font-semibold text-[var(--trail-orange)] hover:underline"
+          >
             {t('help.tutorial.needGpxGuide')}
           </a>
         </aside>
@@ -127,7 +135,7 @@ export function TutorialPage() {
         <div className="grid gap-6 xl:grid-cols-2">
           {tutorialVideos.map((video) => (
             <figure key={video.src} className="rounded-[1.25rem] border border-[var(--evergreen)]/10 bg-[var(--canvas)] p-4">
-              <video controls className="aspect-video w-full rounded-xl border border-[var(--evergreen)]/15 bg-black/80">
+              <video controls preload="none" poster={video.poster} className="aspect-video w-full rounded-xl border border-[var(--evergreen)]/15 bg-black/80">
                 <source src={video.src} type="video/mp4" />
               </video>
               <figcaption className="mt-4">

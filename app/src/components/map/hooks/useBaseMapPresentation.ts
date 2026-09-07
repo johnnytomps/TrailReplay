@@ -1,10 +1,15 @@
 import { useEffect } from 'react';
 import maplibregl from 'maplibre-gl';
 import type { AppSettings, TrailStyleSettings } from '@/types';
+import {
+  BASEMAP_FALLBACK_MAX_ZOOM,
+  BASEMAP_PRESENTATIONS,
+  STATIC_BASEMAP_LAYER_IDS,
+  STATIC_FALLBACK_LAYER_IDS,
+} from '@/components/map/mapStyle';
 
 interface UseBaseMapPresentationOptions {
   currentTrackColor: string | null;
-  currentTrackName: string | null;
   isMapLoaded: boolean;
   mapRef: React.RefObject<maplibregl.Map | null>;
   settings: AppSettings;
@@ -13,7 +18,6 @@ interface UseBaseMapPresentationOptions {
 
 export function useBaseMapPresentation({
   currentTrackColor,
-  currentTrackName,
   isMapLoaded,
   mapRef,
   settings,
@@ -23,25 +27,19 @@ export function useBaseMapPresentation({
     const map = mapRef.current;
     if (!map || !isMapLoaded) return;
 
-    const layerMap: Record<string, string> = {
-      satellite: 'background',
-      street: 'street',
-      topo: 'opentopomap',
-      outdoor: 'opentopomap',
-      'esri-clarity': 'esri-clarity',
-      wayback: 'wayback',
-    };
+    const presentation = BASEMAP_PRESENTATIONS[settings.mapStyle]
+      ?? BASEMAP_PRESENTATIONS.satellite;
 
-    const targetLayer = layerMap[settings.mapStyle] || 'background';
-
-    ['background', 'street', 'opentopomap', 'enhanced-hillshade', 'esri-clarity', 'wayback'].forEach((layerId) => {
+    [...STATIC_BASEMAP_LAYER_IDS, ...STATIC_FALLBACK_LAYER_IDS, 'enhanced-hillshade', 'wayback', 'fallback-wayback'].forEach((layerId) => {
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, 'visibility', 'none');
       }
     });
 
-    if (map.getLayer(targetLayer)) {
-      map.setLayoutProperty(targetLayer, 'visibility', 'visible');
+    for (const layerId of [presentation.fallbackLayerId, presentation.layerId]) {
+      if (map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', 'visible');
+      }
     }
 
     if (map.getLayer('ski-pistes')) {
@@ -57,7 +55,7 @@ export function useBaseMapPresentation({
     }
 
     const showLabels = ['street', 'topo', 'outdoor'].includes(settings.mapStyle)
-      || !!settings.mapOverlays?.placeLabels;
+      || (!!settings.mapOverlays?.placeLabels && settings.mapStyle !== 'mapbox-streets');
     if (map.getLayer('carto-labels')) {
       map.setLayoutProperty('carto-labels', 'visibility', showLabels ? 'visible' : 'none');
     }
@@ -82,8 +80,17 @@ export function useBaseMapPresentation({
     const isWaybackActive = settings.mapStyle === 'wayback';
 
     if (map.getLayer('wayback')) map.removeLayer('wayback');
+    if (map.getLayer('fallback-wayback')) map.removeLayer('fallback-wayback');
     if (map.getSource('wayback')) map.removeSource('wayback');
+    if (map.getSource('fallback-wayback')) map.removeSource('fallback-wayback');
 
+    map.addSource('fallback-wayback', {
+      type: 'raster',
+      tiles: [tileUrl],
+      tileSize: 256,
+      maxzoom: BASEMAP_FALLBACK_MAX_ZOOM,
+      attribution: '© Esri',
+    });
     map.addSource('wayback', {
       type: 'raster',
       tiles: [tileUrl],
@@ -91,7 +98,23 @@ export function useBaseMapPresentation({
       attribution: '© Esri — Source: Esri, Maxar, Earthstar Geographics, CNES/Airbus DS, USDA, USGS, AeroGRID, IGN, and the GIS User Community'
     });
     map.addLayer(
-      { id: 'wayback', type: 'raster', source: 'wayback', layout: { visibility: isWaybackActive ? 'visible' : 'none' } },
+      {
+        id: 'fallback-wayback',
+        type: 'raster',
+        source: 'fallback-wayback',
+        layout: { visibility: isWaybackActive ? 'visible' : 'none' },
+        paint: { 'raster-fade-duration': 0 },
+      },
+      'carto-labels',
+    );
+    map.addLayer(
+      {
+        id: 'wayback',
+        type: 'raster',
+        source: 'wayback',
+        layout: { visibility: isWaybackActive ? 'visible' : 'none' },
+        paint: { 'raster-fade-duration': 250 },
+      },
       'carto-labels'
     );
   }, [isMapLoaded, mapRef, settings.mapStyle, settings.waybackItemURL]);
@@ -114,20 +137,21 @@ export function useBaseMapPresentation({
     const map = mapRef.current;
     if (!map || !isMapLoaded) return;
 
-    if (map.getLayer('main-track-label')) {
-      map.setLayoutProperty('main-track-label', 'visibility', trailStyle.showTrackLabels ? 'visible' : 'none');
-      const color = currentTrackColor || trailStyle.trailColor;
-      map.setPaintProperty('main-track-label', 'text-color', color);
+    if (map.getLayer('trail-line')) {
+      map.setPaintProperty('trail-line', 'line-opacity', trailStyle.ghostTrailOpacity);
     }
+  }, [isMapLoaded, mapRef, trailStyle.ghostTrailOpacity]);
 
-    if (map.getSource('main-track-label')) {
-      (map.getSource('main-track-label') as maplibregl.GeoJSONSource).setData({
-        type: 'Feature',
-        properties: { label: currentTrackName || '' },
-        geometry: { type: 'Point', coordinates: [0, 0] },
-      });
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isMapLoaded) return;
+
+    // The moving label is rendered inside the marker DOM overlay so it shares
+    // the marker's transform and cannot trail a frame behind GeoJSON updates.
+    if (map.getLayer('main-track-label')) {
+      map.setLayoutProperty('main-track-label', 'visibility', 'none');
     }
-  }, [currentTrackColor, currentTrackName, isMapLoaded, mapRef, trailStyle.showTrackLabels, trailStyle.trailColor]);
+  }, [isMapLoaded, mapRef]);
 
   useEffect(() => {
     const map = mapRef.current;

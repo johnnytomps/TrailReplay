@@ -1,17 +1,17 @@
 import { useCallback, useRef, useState } from 'react';
-import { useDropzone } from 'react-dropzone';
+import { useDropzone, type DropEvent } from 'react-dropzone';
 import { useAppStore } from '@/store/useAppStore';
 import { useGPX } from '@/hooks/useGPX';
-import { parseGPX } from '@/utils/gpxParser';
+import { parseGPX, parseKML } from '@/utils/gpxParser';
 import { useI18n } from '@/i18n/useI18n';
 import {
   Upload,
   GitCompareArrows,
 } from 'lucide-react';
 import { ComparisonTrackItem } from '@/components/sidebar/tracks/ComparisonTrackItem';
-import { MapControlsNote } from '@/components/sidebar/tracks/LanguageSelectorCard';
 import { TrackItem } from '@/components/sidebar/tracks/TrackItem';
 import { COMPARISON_COLORS } from '@/components/sidebar/tracks/constants';
+import { trackEvent } from '@/utils/analytics';
 
 export function TracksPanel() {
   const { t } = useI18n();
@@ -27,6 +27,7 @@ export function TracksPanel() {
   const settings = useAppStore((state) => state.settings);
   const setSidebarOpen = useAppStore((state) => state.setSidebarOpen);
   const setExploreMode = useAppStore((state) => state.setExploreMode);
+  const setError = useAppStore((state) => state.setError);
 
   // Comparison track state
   const comparisonTracks = useAppStore((state) => state.comparisonTracks);
@@ -39,12 +40,21 @@ export function TracksPanel() {
 
   const handleComparisonFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !file.name.endsWith('.gpx')) return;
+    if (!file) return;
+
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    if (extension !== 'gpx' && extension !== 'kml') {
+      setError(t('errors.noValidGpx'));
+      e.target.value = '';
+      return;
+    }
 
     setIsParsingComparison(true);
     try {
       const content = await file.text();
-      const track = parseGPX(content, file.name);
+      const track = extension === 'gpx'
+        ? parseGPX(content, file.name)
+        : parseKML(content, file.name);
       const colorIndex = comparisonTracks.length % COMPARISON_COLORS.length;
       addComparisonTrack({
         id: `comparison-${Date.now()}`,
@@ -54,28 +64,52 @@ export function TracksPanel() {
         visible: true,
         offset: 0,
       });
+      trackEvent('comparison_track_added', {
+        comparison_track_count: comparisonTracks.length + 1,
+      });
     } catch (err) {
       console.error('Failed to parse comparison GPX:', err);
+      setError(t('errors.parseGpxFailed'));
     } finally {
       setIsParsingComparison(false);
       if (comparisonFileRef.current) comparisonFileRef.current.value = '';
     }
-  }, [addComparisonTrack, comparisonTracks.length]);
+  }, [addComparisonTrack, comparisonTracks.length, setError, t]);
   
-  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+  const onDrop = useCallback(async (
+    acceptedFiles: File[],
+    _fileRejections: unknown[],
+    event: DropEvent,
+  ) => {
     const trailFiles = acceptedFiles.filter(
-      (file) => file.name.endsWith('.gpx') || file.name.endsWith('.kml') || file.type === 'application/gpx+xml' || file.type === 'application/vnd.google-earth.kml+xml'
+      (file) => {
+        const extension = file.name.split('.').pop()?.toLowerCase();
+        return extension === 'gpx' || extension === 'kml' || extension === 'replay' ||
+          file.type === 'application/gpx+xml' ||
+          file.type === 'application/vnd.google-earth.kml+xml';
+      }
     );
     if (trailFiles.length > 0) {
-      await parseFiles(trailFiles as unknown as FileList);
+      try {
+        await parseFiles(
+          trailFiles,
+          !Array.isArray(event) && event.type === 'drop' ? 'dropzone' : 'file_picker',
+        );
+      } catch {
+        // `parseFiles` already reports the failure through the app store.
+      }
     }
   }, [parseFiles]);
   
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
+    onFileDialogOpen: () => {
+      trackEvent('file_picker_opened', { picker_location: 'tracks_panel' });
+    },
     accept: {
       'application/gpx+xml': ['.gpx'],
       'application/vnd.google-earth.kml+xml': ['.kml'],
+      'application/zip': ['.replay'],
     },
     multiple: true,
   });
@@ -113,16 +147,16 @@ export function TracksPanel() {
       
       {/* Track List */}
       {tracks.length > 0 && (
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-bold text-[var(--evergreen)] uppercase tracking-wide">
+        <section className="border-t border-[var(--evergreen)]/15 pt-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="text-[11px] font-bold uppercase tracking-[0.1em] text-[var(--evergreen)]">
               {t('tracks.loadedTracks', { count: tracks.length })}
             </h3>
-            <span className="text-xs text-[var(--evergreen-60)]">
+            <span className="whitespace-nowrap text-[11px] text-[var(--evergreen-60)]">
               {t('tracks.dragReorder')}
             </span>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-3">
             {tracks.map((track, index) => (
               <TrackItem
                 key={track.id}
@@ -139,7 +173,7 @@ export function TracksPanel() {
               />
             ))}
           </div>
-        </div>
+        </section>
       )}
       
       {/* Comparison Mode */}
@@ -213,10 +247,6 @@ export function TracksPanel() {
           </button>
         </div>
       )}
-
-      <div className="space-y-3 pt-1">
-        <MapControlsNote />
-      </div>
     </div>
   );
 }

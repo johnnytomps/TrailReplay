@@ -7,6 +7,7 @@ type PlaybackSlice = Pick<
   | 'playback'
   | 'cinematicPlayed'
   | 'animationPhase'
+  | 'exportPictureHoldElapsedMs'
   | 'setPlayback'
   | 'play'
   | 'pause'
@@ -17,6 +18,7 @@ type PlaybackSlice = Pick<
   | 'setCurrentSegment'
   | 'setCinematicPlayed'
   | 'setAnimationPhase'
+  | 'setExportPictureHoldElapsedMs'
   | 'resetPlayback'
 >;
 
@@ -24,6 +26,7 @@ export const createPlaybackSlice: AppSliceCreator<PlaybackSlice> = (set) => ({
   playback: createDefaultPlayback(),
   cinematicPlayed: false,
   animationPhase: 'idle',
+  exportPictureHoldElapsedMs: null,
 
   setPlayback: (playback) =>
     set((state) => {
@@ -80,14 +83,22 @@ export const createPlaybackSlice: AppSliceCreator<PlaybackSlice> = (set) => ({
       state.animationPhase = phase;
     }),
 
+  setExportPictureHoldElapsedMs: (elapsedMs) =>
+    set((state) => {
+      state.exportPictureHoldElapsedMs = elapsedMs;
+    }),
+
   resetPlayback: () =>
     set((state) => {
       const routeTimingMode = state.playback.routeTimingMode;
+      const totalDuration = state.playback.totalDuration;
       state.playback = {
         ...createDefaultPlayback(),
         routeTimingMode,
+        totalDuration,
       };
       state.cinematicPlayed = false;
       state.animationPhase = 'idle';
+      state.exportPictureHoldElapsedMs = null;
     }),
 });

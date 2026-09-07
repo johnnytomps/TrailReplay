@@ -176,8 +176,9 @@ describe('createAppStore', () => {
     const state = useStore.getState();
     expect(state.settings.mapStyle).toBe('esri-clarity');
     expect(state.settings.trailStyle.currentIcon).toBe(DEFAULT_ACTIVITY_ICON);
-    expect(state.settings.trailStyle.markerColor).toBe('#C1652F');
+    expect(state.settings.trailStyle.markerColor).toBe('#56C596');
     expect(state.settings.trailStyle.trackLabel).toBe('Track 1');
+    expect(state.settings.journeyStatsMode).toBe('cumulative');
     expect(state.settings.trailStyle).not.toBe(initialTrailStyle);
   });
 

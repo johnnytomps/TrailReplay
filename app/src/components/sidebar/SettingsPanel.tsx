@@ -2,7 +2,16 @@ import { useEffect, useState } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import type { MapStyle, CameraMode, MapOverlays, CameraSettings } from '@/types';
 import { useI18n } from '@/i18n/useI18n';
-import { getFollowBehindZoomLevelForPreset } from '@/utils/followBehindCamera';
+import {
+  FOLLOW_BEHIND_STOP_COUNT,
+  getFollowBehindLevelForStopIndex,
+  getFollowBehindStopIndexForLevel,
+  getNearestFollowBehindPreset,
+} from '@/utils/followBehindCamera';
+import { trackEvent } from '@/utils/analytics';
+import { RouteLandmarksEditor } from './RouteLandmarksEditor';
+import { MapNavigationGuide } from './MapNavigationGuide';
+import { CinematicCameraEditor } from './CinematicCameraEditor';
 import {
   Map as MapIcon,
   Video,
@@ -16,6 +25,9 @@ const MAP_STYLES: { id: MapStyle; nameKey: string; icon: string }[] = [
   { id: 'outdoor', nameKey: 'settings.mapStyles.outdoor', icon: '🌲' },
   { id: 'esri-clarity', nameKey: 'settings.mapStyles.esri', icon: '📡' },
   { id: 'wayback', nameKey: 'settings.mapStyles.wayback', icon: '🕰️' },
+  ...(import.meta.env.VITE_MAPBOX_TOKEN
+    ? [{ id: 'mapbox-streets' as MapStyle, nameKey: 'settings.mapStyles.mapboxStreets', icon: '🗺️' }]
+    : []),
 ];
 
 const MAP_OVERLAYS: { id: string; nameKey: string; icon: string; descriptionKey: string }[] = [
@@ -29,17 +41,16 @@ const CAMERA_MODES: { id: CameraMode; nameKey: string; descriptionKey: string }[
   { id: 'overview', nameKey: 'settings.cameraModes.overview', descriptionKey: 'settings.cameraModes.overviewDesc' },
   { id: 'follow', nameKey: 'settings.cameraModes.follow', descriptionKey: 'settings.cameraModes.followDesc' },
   { id: 'follow-behind', nameKey: 'settings.cameraModes.followBehind', descriptionKey: 'settings.cameraModes.followBehindDesc' },
+  { id: 'cinematic', nameKey: 'settings.cameraModes.cinematic', descriptionKey: 'settings.cameraModes.cinematicDesc' },
 ];
 
-const FOLLOW_PRESETS: Array<{
-  id: CameraSettings['followBehindPreset'];
-  nameKey: string;
-}> = [
-  { id: 'very-close', nameKey: 'settings.followPresets.veryClose' },
-  { id: 'close', nameKey: 'settings.followPresets.close' },
-  { id: 'medium', nameKey: 'settings.followPresets.medium' },
-  { id: 'far', nameKey: 'settings.followPresets.far' },
-];
+/** Label shown for the distance the slider currently sits nearest to. */
+const FOLLOW_PRESET_NAME_KEYS: Record<CameraSettings['followBehindPreset'], string> = {
+  'very-close': 'veryClose',
+  close: 'close',
+  medium: 'medium',
+  far: 'far',
+};
 
 type WaybackItem = {
   releaseNum: number;
@@ -129,11 +140,43 @@ export function SettingsPanel() {
   }, [settings.mapStyle, settings.waybackRelease, setSettings, t]);
 
   const toggleOverlay = (key: keyof MapOverlays) => {
-    setSettings({ mapOverlays: { ...settings.mapOverlays, [key]: !settings.mapOverlays?.[key] } });
+    const enabled = !settings.mapOverlays?.[key];
+    setSettings({ mapOverlays: { ...settings.mapOverlays, [key]: enabled } });
+    trackEvent('feature_enabled', {
+      feature_name: `map_overlay_${key}`,
+      feature_state: enabled ? 'enabled' : 'disabled',
+      feature_context: 'settings',
+    });
+  };
+
+  const selectMapStyle = (style: MapStyle) => {
+    if (settings.mapStyle === style) return;
+    setMapStyle(style);
+    trackEvent('settings_changed', { setting_name: 'map_style', setting_value: style });
+  };
+
+  const selectCameraMode = (mode: CameraMode) => {
+    if (cameraSettings.mode === mode) return;
+    setCameraMode(mode);
+    trackEvent('settings_changed', { setting_name: 'camera_mode', setting_value: mode });
+
+    // Also reported on its own, so adoption of the cinematic camera can be
+    // counted directly rather than filtered out of every settings change.
+    if (mode === 'cinematic') {
+      trackEvent('cinematic_mode_entered', {
+        existing_keyframe_count: useAppStore.getState().cinematicCameraKeyframes.length,
+      });
+    }
   };
 
   return (
     <div className="space-y-6">
+      <div className="rounded-xl border border-[var(--trail-orange)]/30 bg-[var(--trail-orange-15)] p-3">
+        <h3 className="text-sm font-bold text-[var(--evergreen)]">{t('settings.mapCameraTitle')}</h3>
+        <p className="mt-1 text-xs leading-4 text-[var(--evergreen-80)]">{t('settings.mapCameraHint')}</p>
+      </div>
+      <MapNavigationGuide />
+
       {/* Map Style */}
       <div>
         <h3 className="text-sm font-bold text-[var(--evergreen)] mb-3 uppercase tracking-wide flex items-center gap-2">
@@ -144,7 +187,7 @@ export function SettingsPanel() {
           {MAP_STYLES.map((style) => (
             <button
               key={style.id}
-              onClick={() => setMapStyle(style.id)}
+              onClick={() => selectMapStyle(style.id)}
               className={`
                 flex items-center gap-2 p-3 rounded-lg border-2 transition-colors text-left
                 ${settings.mapStyle === style.id
@@ -201,6 +244,8 @@ export function SettingsPanel() {
         )}
 
       </div>
+
+      <RouteLandmarksEditor />
 
       {/* Map Overlays */}
       <div>
@@ -296,7 +341,7 @@ export function SettingsPanel() {
           {CAMERA_MODES.map((mode) => (
             <button
               key={mode.id}
-              onClick={() => setCameraMode(mode.id)}
+              onClick={() => selectCameraMode(mode.id)}
               className={`
                 w-full flex items-center justify-between p-3 rounded-lg border-2 transition-colors
                 ${cameraSettings.mode === mode.id
@@ -323,28 +368,61 @@ export function SettingsPanel() {
         {/* Follow Behind Presets */}
         {cameraSettings.mode === 'follow-behind' && (
           <div className="mt-3 p-3 bg-[var(--evergreen)]/5 rounded-lg">
-            <p className="text-xs text-[var(--evergreen-60)] mb-2">{t('settings.followPresets.title')}</p>
-            <div className="flex gap-2">
-              {FOLLOW_PRESETS.map((preset) => (
-                <button
-                  key={preset.id}
-                  onClick={() =>
-                    setCameraSettings({
-                      followBehindPreset: preset.id,
-                      followBehindZoomLevel: getFollowBehindZoomLevelForPreset(preset.id),
-                    })
-                  }
-                  className={`
-                    flex-1 py-2 px-1 rounded text-xs font-medium transition-colors
-                    ${cameraSettings.followBehindPreset === preset.id
-                      ? 'bg-[var(--trail-orange)] text-[var(--canvas)]'
-                      : 'bg-[var(--evergreen)]/10 text-[var(--evergreen)] hover:bg-[var(--evergreen)]/20'
-                    }
-                  `}
-                >
-                  {t(preset.nameKey)}
-                </button>
-              ))}
+            <div className="flex items-baseline justify-between mb-2">
+              <p className="text-xs text-[var(--evergreen-60)]">{t('settings.followPresets.title')}</p>
+              <span className="text-[10px] font-medium text-[var(--evergreen-60)]">
+                {t(`settings.followPresets.${FOLLOW_PRESET_NAME_KEYS[cameraSettings.followBehindPreset]}`)}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={FOLLOW_BEHIND_STOP_COUNT - 1}
+              step={1}
+              value={getFollowBehindStopIndexForLevel(cameraSettings.followBehindZoomLevel)}
+              onChange={(e) => {
+                const level = getFollowBehindLevelForStopIndex(Number(e.target.value));
+                setCameraSettings({
+                  followBehindZoomLevel: level,
+                  followBehindPreset: getNearestFollowBehindPreset(level),
+                });
+                trackEvent('settings_changed', {
+                  setting_name: 'follow_behind_distance',
+                  setting_value: level,
+                });
+              }}
+              className="w-full accent-[var(--trail-orange)]"
+            />
+            <div className="flex justify-between text-[10px] text-[var(--evergreen-60)]">
+              <span>{t('settings.followPresets.far')}</span>
+              <span>{t('settings.followPresets.veryClose')}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Cinematic keyframes */}
+        {cameraSettings.mode === 'cinematic' && <CinematicCameraEditor />}
+
+        {/* Camera Stability */}
+        {cameraSettings.mode !== 'overview' && (
+          <div className="mt-3 p-3 bg-[var(--evergreen)]/5 rounded-lg">
+            <p className="text-xs text-[var(--evergreen-60)] mb-2">{t('settings.cameraStability.title')}</p>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={cameraSettings.cameraStability}
+              onChange={(e) => {
+                const value = Number(e.target.value);
+                setCameraSettings({ cameraStability: value });
+                trackEvent('settings_changed', { setting_name: 'camera_stability', setting_value: value });
+              }}
+              className="w-full accent-[var(--trail-orange)]"
+            />
+            <div className="flex justify-between text-[10px] text-[var(--evergreen-60)]">
+              <span>{t('settings.cameraStability.stable')}</span>
+              <span>{t('settings.cameraStability.reactive')}</span>
             </div>
           </div>
         )}
@@ -364,7 +442,15 @@ export function SettingsPanel() {
           <input
             type="checkbox"
             checked={settings.show3DTerrain}
-            onChange={(e) => setSettings({ show3DTerrain: e.target.checked })}
+            onChange={(e) => {
+              const enabled = e.target.checked;
+              setSettings({ show3DTerrain: enabled });
+              trackEvent('feature_enabled', {
+                feature_name: 'terrain_3d',
+                feature_state: enabled ? 'enabled' : 'disabled',
+                feature_context: 'settings',
+              });
+            }}
             className="w-5 h-5 accent-[var(--trail-orange)]"
           />
         </label>

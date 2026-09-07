@@ -67,14 +67,30 @@ export interface Journey {
 
 export interface PictureAnnotation {
   id: string;
-  file: File;
+  file: File | null;
   displayFile?: File;
   url: string;
+  isPlaceholder: boolean;
+  originalFileName?: string;
   lat?: number;
   lon?: number;
   timestamp?: Date;
   progress: number;
   position: number;
+  /**
+   * Where the photo sits along the route, in metres from the journey start.
+   *
+   * `progress` depends on the timing mode and therefore has to be recomputed
+   * when that mode changes. Distance along the route does not: it increases
+   * monotonically, so it identifies the point unambiguously even where the
+   * route crosses itself or doubles back, and both timing modes can be
+   * derived from it.
+   */
+  routeDistance?: number;
+  /** Stable journey-segment anchor used when segments are reordered. */
+  routeSegmentId?: string;
+  /** Distance in metres from the start of `routeSegmentId`. */
+  routeSegmentDistance?: number;
   placementSource?: 'gps' | 'timestamp' | 'manual';
   title?: string;
   description?: string;
@@ -100,13 +116,18 @@ export interface PendingPicturePlacement {
     lat: number;
     lon: number;
     progress: number;
+    routeDistance?: number;
+    routeSegmentId?: string;
+    routeSegmentDistance?: number;
   };
 }
 
 export interface VideoAnnotation {
   id: string;
-  file: File;
+  file: File | null;
   url: string;
+  isPlaceholder: boolean;
+  originalFileName?: string;
   lat?: number;
   lon?: number;
   timestamp?: Date;
@@ -134,6 +155,8 @@ export interface TextAnnotation {
   displayDuration: number;
 }
 
+export * from './landmarks';
+
 export interface PlaybackState {
   isPlaying: boolean;
   currentTime: number;
@@ -145,9 +168,10 @@ export interface PlaybackState {
   routeTimingMode: RouteTimingMode;
 }
 
-export type MapStyle = 'satellite' | 'topo' | 'street' | 'outdoor' | 'esri-clarity' | 'wayback';
-export type LanguageCode = 'en' | 'es' | 'ca' | 'fr';
+export type MapStyle = 'satellite' | 'topo' | 'street' | 'outdoor' | 'esri-clarity' | 'wayback' | 'mapbox-streets';
+export type LanguageCode = 'en' | 'es' | 'ca' | 'de' | 'fr';
 export type RouteTimingMode = 'recorded' | 'uniform';
+export type JourneyStatsMode = 'cumulative' | 'per-track';
 
 export interface MapOverlays {
   skiPistes: boolean;
@@ -163,7 +187,7 @@ export interface MapStyleConfig {
   thumbnail?: string;
 }
 
-export type CameraMode = 'overview' | 'follow' | 'follow-behind';
+export type CameraMode = 'overview' | 'follow' | 'follow-behind' | 'cinematic';
 
 export interface CameraSettings {
   mode: CameraMode;
@@ -172,6 +196,8 @@ export interface CameraSettings {
   bearing: number;
   followBehindPreset: 'very-close' | 'close' | 'medium' | 'far';
   followBehindZoomLevel: number;
+  /** 0 = maximally stable/smooth camera, 1 = maximally reactive/tight tracking. */
+  cameraStability: number;
 }
 
 export type VideoFormat = 'webm' | 'mp4';
@@ -184,9 +210,33 @@ export interface VideoExportSettings {
   fps: number;
   resolution: { width: number; height: number };
   aspectRatio: AspectRatio;
-  includeStats: boolean;
-  includeElevation: boolean;
   includeAudio: boolean;
+}
+
+export type SocialShareTemplate = 'map-first' | 'photo-first';
+export type SocialShareAspectRatio = '4:5' | '1:1' | '9:16';
+
+export interface SocialShareRouteTransform {
+  offsetX: number;
+  offsetY: number;
+  scale: number;
+  opacity: number;
+}
+
+export interface SocialShareSettings {
+  template: SocialShareTemplate;
+  aspectRatio: SocialShareAspectRatio;
+  selectedPictureId: string | null;
+  titleMode: 'journey-name' | 'track-name' | 'custom';
+  customTitle: string;
+  locationLabel: string;
+  showLocation: boolean;
+  showStats: boolean;
+  showElevationMiniChart: boolean;
+  routeTransform: SocialShareRouteTransform;
+  /** How far up the data panel (stats + elevation) is shifted from the bottom, as a fraction of poster height (0 = bottom). */
+  dataPanelOffsetY: number;
+  routeGlow: boolean;
 }
 
 export interface HeartRateZone {
@@ -207,7 +257,14 @@ export interface ComparisonTrack {
 
 export type UnitSystem = 'metric' | 'imperial';
 
-export type ColorMode = 'fixed' | 'heartRate';
+export type ColorMode = 'fixed' | 'heartRate' | 'zones';
+
+export interface TrailColorZone {
+  id: string;
+  fromProgress: number;
+  toProgress: number;
+  color: string;
+}
 
 export interface TrailStyleSettings {
   // Trail Color
@@ -215,6 +272,7 @@ export interface TrailStyleSettings {
   colorMode: ColorMode;
   heartRateZones: HeartRateZone[];
   // Marker Settings
+  markerType: 'icon' | 'dot';
   markerColor: string;
   showMarker: boolean;
   markerSize: number;
@@ -223,7 +281,11 @@ export interface TrailStyleSettings {
   // Track Labels
   showTrackLabels: boolean;
   trackLabel: string;
+  ghostTrailOpacity: number;
+  colorZones: TrailColorZone[];
 }
+
+export type StatId = 'distance' | 'duration' | 'pace' | 'elevation' | 'heartRate' | 'speed' | 'altitude';
 
 export interface AppSettings {
   unitSystem: UnitSystem;
@@ -238,6 +300,14 @@ export interface AppSettings {
   trailStyle: TrailStyleSettings;
   waybackRelease: number | null;
   waybackItemURL: string | null;
+  visibleStats: StatId[];
+  journeyStatsMode: JourneyStatsMode;
+  statsPosition: { x: number; y: number } | null;
+  statsScale: number;
+  statsLayout: 'auto' | 'horizontal' | 'vertical';
+  statsColumns: number | null;
+  paceMode: 'cumulative' | 'per-km';
+  showElevationProfile: boolean;
 }
 
 export interface LiveStats {

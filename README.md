@@ -58,7 +58,6 @@ https://github.com/user-attachments/assets/c42e5efd-6c08-4591-ab66-92cc16484f24
 From the repository root:
 
 ```bash
-npm install
 npm --prefix app install
 npm run dev
 ```
@@ -88,18 +87,18 @@ The root scripts delegate to the active frontend in `app/`.
 - MapLibre GL for the interactive map and route playback surfaces.
 - Zustand for app state and editor workflows.
 - Vitest and Testing Library for test coverage.
-- A Cloudflare Pages Function in [`functions/api/contact.js`](./functions/api/contact.js) for feedback submissions.
+- GitHub Discussions for community feedback and feature requests.
 
 ## Repository Layout
 
 - `app/`: active TrailReplay frontend, help pages, public assets, and tests
 - `functions/`: Cloudflare Pages Functions for the deployed site
-- `docs/`: internal notes, issue plans, and branding assets
+- `docs/branding-assets/`: logo files and brand assets used by the project
+- `docs/internal/`: maintainer-facing implementation notes and issue writeups
 - `media/`: repository media used in documentation and demos
 
 ## Notes
 
 - The active runtime is the browser app inside `app/`.
-- Legacy V1 work is not part of the current product surface.
 - Help, tutorial, and GPX guide pages ship alongside the main app.
-- GPX processing stays local in the browser by default; feedback submissions are the main server-side flow in this repo.
+- GPX processing stays local in the browser by default; community feedback is posted through GitHub Discussions.

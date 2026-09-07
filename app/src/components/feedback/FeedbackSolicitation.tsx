@@ -1,6 +1,10 @@
-import { useState, useEffect, useCallback } from 'react';
-import { MessageCircle, X, ThumbsUp, Lightbulb, Wrench, Loader2 } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { MessageCircle, X, ThumbsUp, Lightbulb, Wrench, Save, ExternalLink } from 'lucide-react';
 import { useI18n } from '@/i18n/useI18n';
+import { trackEvent } from '@/utils/analytics';
+import { useAppStore } from '@/store/useAppStore';
+import { downloadReplayArchive } from '@/utils/projectFile/downloadReplayArchive';
+import { hasUnsavedProjectContent } from '@/utils/projectFile/hasUnsavedWork';
 
 const STORAGE_KEY = 'trailreplay_feedback_solicited';
 const ACTIVITY_KEY = 'trailreplay_activity';
@@ -12,6 +16,11 @@ const MIN_ACTIVITY = 3;
 const MAYBE_LATER_COOLDOWN = 86400000; // 24 hours
 const MIN_WIDTH_FOR_POPUP = 900;
 const MIN_FEEDBACK_LENGTH = 15;
+const DISCUSSION_URLS = {
+  loveIt: 'https://github.com/alexalmansa/TrailReplay/discussions/new?category=show-and-tell',
+  needsWork: 'https://github.com/alexalmansa/TrailReplay/discussions/new?category=general',
+  featureRequest: 'https://github.com/alexalmansa/TrailReplay/discussions/new?category=ideas',
+} as const;
 
 interface ActivityData {
   count: number;
@@ -52,10 +61,15 @@ export function FeedbackSolicitation() {
   const [showForm, setShowForm] = useState(false);
   const [feedbackCategory, setFeedbackCategory] = useState<'loveIt' | 'needsWork' | 'featureRequest' | null>(null);
   const [feedback, setFeedback] = useState('');
-  const [email, setEmail] = useState('');
   const [submitted, setSubmitted] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [messageCopied, setMessageCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [popupBlockedUrl, setPopupBlockedUrl] = useState<string | null>(null);
+  const [isSavingProject, setIsSavingProject] = useState(false);
+  const hasUnsavedWork = useAppStore((state) =>
+    hasUnsavedProjectContent({ tracks: state.tracks, pictures: state.pictures, journey: state.journey })
+  );
+  const promptTimeoutRef = useRef<number | null>(null);
   const [isNarrowScreen, setIsNarrowScreen] = useState(
     typeof window !== 'undefined' ? window.innerWidth < MIN_WIDTH_FOR_POPUP : false
   );
@@ -76,10 +90,22 @@ export function FeedbackSolicitation() {
 
   useEffect(() => {
     if (isNarrowScreen) {
+      if (promptTimeoutRef.current !== null) {
+        window.clearTimeout(promptTimeoutRef.current);
+        promptTimeoutRef.current = null;
+      }
       setShowPopup(false);
       setShowForm(false);
     }
   }, [isNarrowScreen]);
+
+  useEffect(() => {
+    return () => {
+      if (promptTimeoutRef.current !== null) {
+        window.clearTimeout(promptTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const checkAndShowSolicitation = useCallback((activity: ActivityData) => {
     if (isNarrowScreen) {
@@ -87,13 +113,16 @@ export function FeedbackSolicitation() {
     }
 
     // Don't show if already solicited
-    if (safeStorageGetAny(STORAGE_KEY, LEGACY_STORAGE_KEY) === 'true') {
+    if (
+      safeStorageGetAny(STORAGE_KEY, LEGACY_STORAGE_KEY) === 'true' ||
+      promptTimeoutRef.current !== null
+    ) {
       return;
     }
 
     // Check maybe later cooldown
     const maybeLater = safeStorageGetAny(MAYBE_LATER_KEY, LEGACY_MAYBE_LATER_KEY);
-    if (maybeLater && Date.now() - parseInt(maybeLater) < MAYBE_LATER_COOLDOWN) {
+    if (maybeLater && Date.now() - Number.parseInt(maybeLater, 10) < MAYBE_LATER_COOLDOWN) {
       return;
     }
 
@@ -108,7 +137,17 @@ export function FeedbackSolicitation() {
     }
 
     // Show popup after a short delay
-    setTimeout(() => setShowPopup(true), 2000);
+    promptTimeoutRef.current = window.setTimeout(() => {
+      promptTimeoutRef.current = null;
+      setShowPopup(true);
+      trackEvent('feedback_prompt_shown', {
+        activity_count_bucket: activity.count <= 5
+          ? '3_5'
+          : activity.count <= 10
+            ? '6_10'
+            : '10_plus',
+      });
+    }, 2000);
   }, [isNarrowScreen]);
 
   // Track activity
@@ -148,28 +187,30 @@ export function FeedbackSolicitation() {
   }, [checkAndShowSolicitation, isNarrowScreen]);
 
   const handleYes = () => {
+    trackEvent('feedback_prompt_action', { feedback_prompt_action: 'open_form' });
     setShowPopup(false);
     setShowForm(true);
   };
 
   const handleMaybeLater = () => {
+    trackEvent('feedback_prompt_action', { feedback_prompt_action: 'maybe_later' });
     setShowPopup(false);
     safeStorageSet(MAYBE_LATER_KEY, Date.now().toString());
   };
 
   const handleDismiss = () => {
+    trackEvent('feedback_prompt_action', { feedback_prompt_action: 'dismiss' });
     setShowPopup(false);
     safeStorageSet(STORAGE_KEY, 'true');
   };
 
-  const handleSubmitFeedback = async () => {
+  const handleSubmitFeedback = () => {
     const trimmedFeedback = feedback.trim();
     if (!feedbackCategory || trimmedFeedback.length < MIN_FEEDBACK_LENGTH) {
       setError(t('feedback.minimumLengthError', { count: MIN_FEEDBACK_LENGTH }));
       return;
     }
 
-    setIsSubmitting(true);
     setError(null);
 
     // Build the feedback message
@@ -192,49 +233,50 @@ export function FeedbackSolicitation() {
       trimmedFeedback,
     ].join('\n');
 
-    try {
-      const res = await fetch('/api/contact', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'V2 Feedback User',
-          email: email || '',
-          message,
-          website: '', // honeypot field
-          meta: {
-            path: location.pathname,
-            ua: navigator.userAgent,
-            source: 'feedback-solicitation',
-            feedbackCategory,
-          },
-        }),
-      });
+    const discussionUrl = DISCUSSION_URLS[feedbackCategory];
+    // Never fall back to navigating the current tab — that would leave the app
+    // (and any unsaved project work, since there's no autosave) if the popup is blocked.
+    const discussionWindow = window.open(discussionUrl, '_blank', 'noopener,noreferrer');
 
-      if (res.ok) {
-        safeStorageSet(STORAGE_KEY, 'true');
-        setSubmitted(true);
-        setTimeout(() => {
-          setShowForm(false);
-          setSubmitted(false);
-        }, 3000);
-      } else {
-        const data = await res.json().catch(() => ({}));
-        setError(data?.error || t('feedback.error'));
-      }
-    } catch {
-      setError(t('feedback.errorSend'));
+    void navigator.clipboard?.writeText(message)
+      .then(() => setMessageCopied(true))
+      .catch(() => setMessageCopied(false));
+
+    trackEvent('feedback_discussion_opened', { feedback_category: feedbackCategory });
+    safeStorageSet(STORAGE_KEY, 'true');
+
+    if (!discussionWindow) {
+      setPopupBlockedUrl(discussionUrl);
+      return;
+    }
+
+    setSubmitted(true);
+    setTimeout(() => {
+      setShowForm(false);
+      setSubmitted(false);
+      setMessageCopied(false);
+    }, 4000);
+  };
+
+  const handleSaveProject = async () => {
+    setIsSavingProject(true);
+    try {
+      await downloadReplayArchive(useAppStore.getState(), 'feedback_popup_blocked');
+    } catch (e) {
+      console.error('Failed to save project:', e);
     } finally {
-      setIsSubmitting(false);
+      setIsSavingProject(false);
     }
   };
 
   const handleCloseForm = () => {
     setShowForm(false);
+    setPopupBlockedUrl(null);
     safeStorageSet(STORAGE_KEY, 'true');
   };
 
   const trimmedFeedbackLength = feedback.trim().length;
-  const canSubmit = Boolean(feedbackCategory) && trimmedFeedbackLength >= MIN_FEEDBACK_LENGTH && !isSubmitting;
+  const canSubmit = Boolean(feedbackCategory) && trimmedFeedbackLength >= MIN_FEEDBACK_LENGTH;
 
   const questionLabel = feedbackCategory
     ? t(`feedback.${feedbackCategory}Question`)
@@ -315,8 +357,42 @@ export function FeedbackSolicitation() {
                   {t('feedback.thanksTitle')}
                 </h3>
                 <p className="text-[var(--evergreen-60)]">
-                  {t('feedback.thanksBody')}
+                  {t(messageCopied ? 'feedback.discussionOpenedCopied' : 'feedback.discussionOpened')}
                 </p>
+              </div>
+            ) : popupBlockedUrl ? (
+              <div className="py-2">
+                <h3 className="text-lg font-bold text-[var(--evergreen)] mb-2">
+                  {t('feedback.popupBlockedTitle')}
+                </h3>
+                <p className="text-sm text-[var(--evergreen-60)] mb-4">
+                  {messageCopied ? t('feedback.popupBlockedBodyCopied') : t('feedback.popupBlockedBody')}
+                </p>
+                {hasUnsavedWork && (
+                  <button
+                    onClick={handleSaveProject}
+                    disabled={isSavingProject}
+                    className="w-full mb-2 py-2 px-4 bg-[var(--trail-orange)] text-[var(--canvas)] rounded-lg font-medium hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    <Save className="w-4 h-4" />
+                    {isSavingProject ? t('projectFile.saving') : t('sidebar.saveProject')}
+                  </button>
+                )}
+                <a
+                  href={popupBlockedUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full py-2 px-4 border-2 border-[var(--evergreen)] text-[var(--evergreen)] rounded-lg font-medium hover:bg-[var(--evergreen)] hover:text-[var(--canvas)] transition-colors flex items-center justify-center gap-2"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  {t('feedback.openDiscussion')}
+                </a>
+                <button
+                  onClick={handleCloseForm}
+                  className="w-full mt-2 py-2 px-4 text-sm text-[var(--evergreen-60)] hover:text-[var(--evergreen)]"
+                >
+                  {t('common.close')}
+                </button>
               </div>
             ) : (
               <>
@@ -375,23 +451,13 @@ export function FeedbackSolicitation() {
 
                 <div className="mb-4">
                   <label className="block text-sm font-medium text-[var(--evergreen)] mb-2">
-                    {t('feedback.emailLabel')}
-                  </label>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder={t('feedback.emailPlaceholder')}
-                    className="w-full p-3 border-2 border-[var(--evergreen-40)] rounded-lg text-sm focus:border-[var(--trail-orange)] focus:outline-none"
-                  />
-                </div>
-
-                <div className="mb-4">
-                  <label className="block text-sm font-medium text-[var(--evergreen)] mb-2">
                     {questionLabel}
                   </label>
                   <p className="mb-2 text-xs text-[var(--evergreen-60)]">
                     {t('feedback.answerHelper')}
+                  </p>
+                  <p className="mb-2 text-xs text-[var(--evergreen-60)]">
+                    {t('feedback.discussionHint')}
                   </p>
                   <textarea
                     value={feedback}
@@ -418,7 +484,6 @@ export function FeedbackSolicitation() {
                 <div className="flex gap-2">
                   <button
                     onClick={handleCloseForm}
-                    disabled={isSubmitting}
                     className="flex-1 py-2 px-4 border-2 border-[var(--evergreen)] text-[var(--evergreen)] rounded-lg font-medium hover:bg-[var(--evergreen)] hover:text-[var(--canvas)] transition-colors disabled:opacity-50"
                   >
                     {t('feedback.skip')}
@@ -428,14 +493,7 @@ export function FeedbackSolicitation() {
                     disabled={!canSubmit}
                     className="flex-1 py-2 px-4 bg-[var(--trail-orange)] text-[var(--canvas)] rounded-lg font-medium hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
-                    {isSubmitting ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        {t('feedback.submitting')}
-                      </>
-                    ) : (
-                      t('feedback.submit')
-                    )}
+                    {t('feedback.openDiscussion')}
                   </button>
                 </div>
               </>

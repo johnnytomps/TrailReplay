@@ -1,5 +1,6 @@
-import { X, Github, Instagram, MessageSquare, Heart, ExternalLink, Shield, FileText, BookOpen, Download } from 'lucide-react';
+import { X, Github, Instagram, MessageSquare, Heart, ExternalLink, Shield, FileText, BookOpen, Download, Sparkles, Building2 } from 'lucide-react';
 import { useI18n } from '@/i18n/useI18n';
+import { trackEvent } from '@/utils/analytics';
 
 interface InfoPanelProps {
   onClose: () => void;
@@ -44,7 +45,7 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
             {t('info.builtWithBody')}
           </p>
           <a
-            href="/acknowledgments.html"
+            href="/acknowledgments"
             className="inline-flex items-center gap-1 text-sm text-[var(--trail-orange)] hover:underline"
           >
             <span>{t('info.acknowledgments')}</span>
@@ -61,13 +62,13 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
           </p>
           <div className="space-y-2">
             <InfoCard
-              href="/tutorial.html"
+              href="/tutorial"
               icon={<BookOpen className="w-4 h-4" />}
               label={t('info.tutorial')}
               description={t('info.tutorialDesc')}
             />
             <InfoCard
-              href="/gpx-download-guide.html"
+              href="/gpx-download-guide"
               icon={<Download className="w-4 h-4" />}
               label={t('info.gpxGuide')}
               description={t('info.gpxGuideDesc')}
@@ -134,6 +135,12 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
               label={t('info.instagram')}
               external
             />
+            <InfoLink
+              href="https://bresca.ai"
+              icon={<Building2 className="w-4 h-4" />}
+              label={t('info.builtBy')}
+              external
+            />
           </div>
         </div>
 
@@ -146,6 +153,7 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
             href="https://ko-fi.com/alexalmansa"
             target="_blank"
             rel="noopener noreferrer"
+            onClick={() => trackEvent('support_clicked', { support_location: 'info_panel' })}
             className="flex items-center gap-2 p-3 bg-[var(--trail-orange)]/10 hover:bg-[var(--trail-orange)]/20 rounded-lg transition-colors group"
           >
             <Heart className="w-5 h-5 text-[var(--trail-orange)]" />
@@ -164,12 +172,12 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
           </h3>
           <div className="space-y-1">
             <InfoLink
-              href="/privacy.html"
+              href="/privacy"
               icon={<Shield className="w-4 h-4" />}
               label={t('info.privacy')}
             />
             <InfoLink
-              href="/terms.html"
+              href="/terms"
               icon={<FileText className="w-4 h-4" />}
               label={t('info.terms')}
             />
@@ -195,6 +203,20 @@ export function InfoPanel({ onClose }: InfoPanelProps) {
             <ExternalLink className="w-4 h-4 text-[var(--evergreen-60)] group-hover:text-[var(--evergreen)]" />
           </a>
         </div>
+
+        {/* More Tools */}
+        <div className="space-y-2">
+          <h3 className="text-xs font-bold text-[var(--evergreen)] uppercase tracking-wide">
+            {t('info.moreTools')}
+          </h3>
+          <div className="space-y-1">
+            <InfoLink href="/gpx-animation" icon={<Sparkles className="w-4 h-4" />} label={t('info.gpxAnimator')} />
+            <InfoLink href="/strava-to-video" icon={<Sparkles className="w-4 h-4" />} label={t('info.stravaToVideo')} />
+            <InfoLink href="/garmin-to-video" icon={<Sparkles className="w-4 h-4" />} label={t('info.garminToVideo')} />
+            <InfoLink href="/cycling-route-animation" icon={<Sparkles className="w-4 h-4" />} label={t('info.cyclingRouteAnimation')} />
+            <InfoLink href="/running-route-animation" icon={<Sparkles className="w-4 h-4" />} label={t('info.runningRouteAnimation')} />
+          </div>
+        </div>
       </div>
 
       {/* Footer */}
@@ -217,6 +239,14 @@ function InfoCard({ href, icon, label, description, external }: InfoCardProps) {
       href={href}
       target={external ? '_blank' : undefined}
       rel={external ? 'noopener noreferrer' : undefined}
+      onClick={() => {
+        if (href === '/tutorial' || href === '/gpx-download-guide') {
+          trackEvent('help_cta_clicked', {
+            cta_location: 'info_panel',
+            target_page: href === '/tutorial' ? 'tutorial' : 'gpx_guide',
+          });
+        }
+      }}
       className="flex items-start gap-3 rounded-xl border border-[var(--evergreen)]/10 bg-[var(--trail-orange)]/6 p-3 transition-colors hover:border-[var(--trail-orange)]/30 hover:bg-[var(--trail-orange)]/10"
     >
       <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-[var(--trail-orange)] shadow-sm">

@@ -7,14 +7,17 @@ import { createId } from '@/utils/id';
 import { TrackSegmentItem, TransportSegmentItem } from './journey/JourneySegmentItems';
 import { TRANSPORT_MODES } from './journey/journeyTransport';
 import { createTransportSegment } from './journey/createTransportSegment';
+import { trackEvent } from '@/utils/analytics';
 import {
   Plus,
   Clock,
+  Edit3,
   Route,
   GitCompareArrows,
 } from 'lucide-react';
 
 const DEFAULT_TRACK_SEGMENT_DURATION_MS = 30_000;
+const VIDEO_DURATION_OPTIONS = [15, 30, 60, 90] as const;
 
 export function JourneyPanel() {
   const { t } = useI18n();
@@ -27,6 +30,7 @@ export function JourneyPanel() {
   const updateJourneySegmentDuration = useAppStore((state) => state.updateJourneySegmentDuration);
   const clearJourney = useAppStore((state) => state.clearJourney);
   const settings = useAppStore((state) => state.settings);
+  const setSettings = useAppStore((state) => state.setSettings);
   const routeTimingMode = useAppStore((state) => state.playback.routeTimingMode);
   const setRouteTimingMode = useAppStore((state) => state.setRouteTimingMode);
   const seekToProgress = useAppStore((state) => state.seekToProgress);
@@ -34,8 +38,25 @@ export function JourneyPanel() {
   const [showTransportMenu, setShowTransportMenu] = useState(false);
   const [selectedTransportIndex, setSelectedTransportIndex] = useState<number | null>(null);
   const [editingSegment, setEditingSegment] = useState<string | null>(null);
-  const [customDuration, setCustomDuration] = useState<number>(30);
+  // '' while the input is cleared mid-edit, so the field doesn't snap to a
+  // forced minimum the instant the user deletes all the digits.
+  const [customDuration, setCustomDuration] = useState<number | ''>(30);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+
+  const setVideoDuration = (seconds: number) => {
+    const totalMilliseconds = seconds * 1000;
+    const currentTotal = journeySegments.reduce((total, segment) => total + Math.max(segment.duration || 0, 0), 0);
+    const fallbackWeight = journeySegments.length > 0 ? 1 / journeySegments.length : 0;
+    let assigned = 0;
+
+    reorderJourneySegments(journeySegments.map((segment, index) => {
+      const isLast = index === journeySegments.length - 1;
+      const weight = currentTotal > 0 ? (segment.duration || 0) / currentTotal : fallbackWeight;
+      const duration = isLast ? totalMilliseconds - assigned : Math.round(totalMilliseconds * weight);
+      assigned += duration;
+      return { ...segment, duration };
+    }));
+  };
   
   // Calculate total journey stats
   const totalDistance = journeySegments.reduce((sum, seg) => {
@@ -113,13 +134,19 @@ export function JourneyPanel() {
     const newSegments = [...journeySegments];
     newSegments.splice(selectedTransportIndex + 1, 0, newTransportSegment);
     reorderJourneySegments(newSegments);
+    trackEvent('transport_added', {
+      transport_mode: mode,
+      journey_segment_count: newSegments.length,
+      journey_track_count: newSegments.filter((segment) => segment.type === 'track').length,
+    });
 
     setShowTransportMenu(false);
     setSelectedTransportIndex(null);
   };
   
-  const updateSegmentDuration = (segmentId: string, duration: number) => {
-    updateJourneySegmentDuration(segmentId, duration * 1000);
+  const updateSegmentDuration = (segmentId: string, duration: number | '') => {
+    const boundedDuration = Math.max(1, duration || 1);
+    updateJourneySegmentDuration(segmentId, boundedDuration * 1000);
     setEditingSegment(null);
   };
   
@@ -147,6 +174,61 @@ export function JourneyPanel() {
 
   return (
     <div className="space-y-4">
+      <section className="rounded-xl border border-[var(--trail-orange)]/40 bg-[var(--trail-orange-15)] p-3">
+        <h3 className="text-sm font-bold text-[var(--evergreen)]">{t('journey.videoTimingTitle')}</h3>
+        <p className="mt-1 text-xs leading-4 text-[var(--evergreen-80)]">{t('journey.videoTimingHint')}</p>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {VIDEO_DURATION_OPTIONS.map((seconds) => {
+            const isActive = Math.round(totalDuration / 1000) === seconds;
+            return (
+              <button
+                key={seconds}
+                type="button"
+                onClick={() => setVideoDuration(seconds)}
+                className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                  isActive
+                    ? 'border-[var(--evergreen)] bg-[var(--evergreen)] text-[var(--canvas)]'
+                    : 'border-[var(--evergreen)]/20 bg-[var(--canvas)] text-[var(--evergreen)] hover:border-[var(--trail-orange)]/60'
+                }`}
+              >
+                <span className="block text-sm font-bold">{t('journey.durationPreset', { seconds })}</span>
+                <span className={`block text-[10px] ${isActive ? 'text-[var(--canvas)]/75' : 'text-[var(--evergreen-60)]'}`}>
+                  {t('journey.durationPresetHint')}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-2 flex items-start gap-2 rounded-lg border border-[var(--evergreen)]/15 bg-[var(--canvas)]/60 px-3 py-2 text-xs text-[var(--evergreen-80)]">
+          <Edit3 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--trail-orange)]" aria-hidden="true" />
+          <p>{t('journey.customDurationHint')}</p>
+        </div>
+        <div className="mt-4 border-t border-[var(--evergreen)]/15 pt-3">
+          <h4 className="text-xs font-bold uppercase tracking-wide text-[var(--evergreen)]">{t('journey.routeTiming')}</h4>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--evergreen-60)]">{t('journey.routeTimingHint')}</p>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            {(['recorded', 'uniform'] as const).map((mode) => {
+              const active = routeTimingMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setRouteTimingMode(mode)}
+                  aria-pressed={active}
+                  className={`min-w-0 rounded-lg border px-2 py-2 text-xs font-semibold transition-colors ${
+                    active
+                      ? 'border-[var(--evergreen)] bg-[var(--evergreen)] text-[var(--canvas)]'
+                      : 'border-[var(--evergreen)]/20 bg-[var(--canvas)] text-[var(--evergreen)] hover:border-[var(--trail-orange)]/60'
+                  }`}
+                >
+                  {mode === 'recorded' ? t('journey.routeTimingRecorded') : t('journey.routeTimingUniform')}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
       {/* Journey Stats */}
       {journeySegments.length > 0 && (
         <div className="bg-[var(--evergreen)] text-[var(--canvas)] p-3 rounded-lg">
@@ -165,8 +247,44 @@ export function JourneyPanel() {
         </div>
       )}
 
+      {journeySegments.filter((segment) => segment.type === 'track').length > 1 && (
+        <section className="rounded-xl border border-[var(--evergreen)]/20 bg-[var(--evergreen)]/5 p-3">
+          <div className="flex items-start gap-2">
+            <GitCompareArrows className="mt-0.5 h-4 w-4 shrink-0 text-[var(--trail-orange)]" />
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wide text-[var(--evergreen)]">
+                {t('journey.statsMode')}
+              </h3>
+              <p className="mt-1 text-[11px] leading-4 text-[var(--evergreen-60)]">
+                {t('journey.statsModeHint')}
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            {(['cumulative', 'per-track'] as const).map((mode) => {
+              const active = settings.journeyStatsMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setSettings({ journeyStatsMode: mode })}
+                  aria-pressed={active}
+                  className={`min-w-0 rounded-lg border px-2 py-2 text-xs font-semibold transition-colors ${
+                    active
+                      ? 'border-[var(--evergreen)] bg-[var(--evergreen)] text-[var(--canvas)]'
+                      : 'border-[var(--evergreen)]/20 bg-[var(--canvas)] text-[var(--evergreen)] hover:border-[var(--trail-orange)]/60 hover:bg-[var(--trail-orange-15)]'
+                  }`}
+                >
+                  {t(mode === 'cumulative' ? 'journey.statsModeCumulative' : 'journey.statsModePerTrack')}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       {/* Quick Start */}
-      {tracks.length > 0 && (
+      {tracks.length > 1 && (
         <div className="bg-[var(--trail-orange-15)] border border-[var(--trail-orange)]/30 rounded-lg p-3">
           <h3 className="text-xs font-bold text-[var(--trail-orange)] uppercase tracking-wide mb-2">
             {t('journey.quickStart')}
@@ -194,7 +312,7 @@ export function JourneyPanel() {
       )}
       
       {/* Add Tracks */}
-      {tracks.length > 0 && (
+      {tracks.length > 1 && (
         <div>
           <h3 className="text-sm font-bold text-[var(--evergreen)] mb-2 uppercase tracking-wide">
             {t('journey.addTracksTitle')}
@@ -243,37 +361,6 @@ export function JourneyPanel() {
           )}
         </div>
 
-        <div className="mb-3 rounded-lg border border-[var(--evergreen)]/20 bg-[var(--evergreen)]/5 p-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-xs font-bold uppercase tracking-wide text-[var(--evergreen)]">
-                {t('journey.routeTiming')}
-              </p>
-              <p className="mt-1 text-[10px] text-[var(--evergreen-60)]">
-                {t('journey.routeTimingHint')}
-              </p>
-            </div>
-          </div>
-          <div className="mt-3 grid grid-cols-2 gap-1">
-            {(['recorded', 'uniform'] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                onClick={() => setRouteTimingMode(mode)}
-                className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
-                  routeTimingMode === mode
-                    ? 'bg-[var(--evergreen)] text-[var(--canvas)]'
-                    : 'bg-[var(--canvas)] text-[var(--evergreen)] border border-[var(--evergreen)]/20 hover:bg-[var(--evergreen)]/5'
-                }`}
-              >
-                {mode === 'recorded'
-                  ? t('journey.routeTimingRecorded')
-                  : t('journey.routeTimingUniform')}
-              </button>
-            ))}
-          </div>
-        </div>
-        
         {journeySegments.length === 0 ? (
           <div className="text-center py-8 text-[var(--evergreen-60)] border-2 border-dashed border-[var(--evergreen)]/20 rounded-lg">
             <p className="text-sm">{t('journey.emptyTitle')}</p>
@@ -432,7 +519,20 @@ export function JourneyPanel() {
                   <input
                     type="number"
                     value={customDuration}
-                    onChange={(e) => setCustomDuration(Math.max(1, parseInt(e.target.value) || 1))}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      if (raw === '') {
+                        setCustomDuration('');
+                        return;
+                      }
+                      const parsed = parseInt(raw, 10);
+                      if (!Number.isNaN(parsed)) {
+                        setCustomDuration(Math.max(1, parsed));
+                      }
+                    }}
+                    onBlur={() => {
+                      if (customDuration === '') setCustomDuration(1);
+                    }}
                     className="flex-1 px-3 py-2 border-2 border-[var(--evergreen)]/30 rounded-lg bg-[var(--canvas)] text-[var(--evergreen)]"
                     min="1"
                     autoFocus

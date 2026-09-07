@@ -6,14 +6,13 @@ interface PlaybackProviderProps {
 }
 
 // Animation timing constants
-const INTRO_DURATION = 2000; // 2 seconds for cinematic zoom-in
-const OUTRO_DELAY = 1000; // 1 second delay before zoom-out
+const INTRO_DURATION = 1500; // Quick cinematic zoom-in without a dead hold
+const OUTRO_DELAY = 0; // Start the final fly-out as soon as the route ends
 const OUTRO_DURATION = 3000; // 3 seconds for zoom-out
 const AUTO_RESET_DELAY = 3000; // 3 seconds after outro before auto-reset
 
 // Duration limits (in milliseconds)
-const MIN_DURATION = 30000; // 30 seconds minimum
-const MAX_DURATION = 120000; // 120 seconds maximum
+const MIN_DURATION = 15000; // Keep the 15-second Timeline preset valid
 
 export function PlaybackProvider({ children }: PlaybackProviderProps) {
   const playback = useAppStore((state) => state.playback);
@@ -22,6 +21,7 @@ export function PlaybackProvider({ children }: PlaybackProviderProps) {
   const journeySegments = useAppStore((state) => state.journeySegments);
   const cinematicPlayed = useAppStore((state) => state.cinematicPlayed);
   const animationPhase = useAppStore((state) => state.animationPhase);
+  const isDeterministicExport = useAppStore((state) => state.isDeterministicExport);
   const setPlayback = useAppStore((state) => state.setPlayback);
   const pause = useAppStore((state) => state.pause);
   const setCinematicPlayed = useAppStore((state) => state.setCinematicPlayed);
@@ -36,8 +36,10 @@ export function PlaybackProvider({ children }: PlaybackProviderProps) {
 
   const activeTrack = tracks.find((t) => t.id === activeTrackId);
 
-  // Calculate total duration based on journey segments or active track
-  // Duration is clamped between 30-120 seconds for good viewing experience
+  // Calculate total duration based on journey segments or active track.
+  // Only a floor is enforced (to keep the 15-second Timeline preset valid);
+  // there's no upper cap, so segment durations set in the Journey panel are
+  // fully honored regardless of how long the resulting video is.
   const calculateTotalDuration = useCallback(() => {
     let duration = 0;
 
@@ -49,8 +51,7 @@ export function PlaybackProvider({ children }: PlaybackProviderProps) {
       duration = 60000;
     }
 
-    // Clamp duration between MIN and MAX
-    return Math.max(MIN_DURATION, Math.min(MAX_DURATION, duration));
+    return Math.max(MIN_DURATION, duration);
   }, [journeySegments, activeTrack]);
 
   // Clear all timeouts
@@ -107,7 +108,9 @@ export function PlaybackProvider({ children }: PlaybackProviderProps) {
 
   // Animation loop - only run when in 'playing' phase
   useEffect(() => {
-    if (!playback.isPlaying || animationPhase !== 'playing') {
+    // Video export owns playback time itself. It advances exactly one route
+    // interval per encoded frame, so this wall-clock rAF loop must stay idle.
+    if (!playback.isPlaying || animationPhase !== 'playing' || isDeterministicExport) {
       if (animationRef.current) {
         cancelAnimationFrame(animationRef.current);
         animationRef.current = null;
@@ -165,7 +168,7 @@ export function PlaybackProvider({ children }: PlaybackProviderProps) {
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [playback.isPlaying, animationPhase, calculateTotalDuration, pause, setPlayback, setAnimationPhase, resetPlayback]);
+  }, [playback.isPlaying, animationPhase, calculateTotalDuration, isDeterministicExport, pause, setPlayback, setAnimationPhase, resetPlayback]);
 
   // Update total duration when track or journey changes
   useEffect(() => {

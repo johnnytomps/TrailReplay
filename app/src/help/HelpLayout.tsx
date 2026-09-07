@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { ArrowLeft, ExternalLink, Sparkles } from 'lucide-react';
 import { useI18n } from '@/i18n/useI18n';
+import { trackEvent } from '@/utils/analytics';
 
 interface HelpHeaderAction {
   href: string;
@@ -63,7 +64,16 @@ export function HelpLayout({ eyebrow, title, description, headerActions = [], ch
                 {description}
               </p>
               <div className="mt-6 flex flex-wrap gap-3">
-                <a href="/" className="tr-btn tr-btn-primary">{t('help.common.openApp')}</a>
+                <a
+                  href="/"
+                  onClick={() => trackEvent('help_cta_clicked', {
+                    cta_location: 'help_page',
+                    target_page: 'app',
+                  })}
+                  className="tr-btn tr-btn-primary"
+                >
+                  {t('help.common.openApp')}
+                </a>
                 <a
                   href="https://github.com/alexalmansa/TrailReplay"
                   target="_blank"
@@ -91,6 +101,28 @@ export function HelpLayout({ eyebrow, title, description, headerActions = [], ch
         </section>
 
         {children}
+
+        <section className="border-t border-[var(--evergreen)]/12 pt-8">
+          <h2 className="text-lg font-bold">Create your route video</h2>
+          <div className="mt-4 flex flex-wrap gap-x-5 gap-y-3 text-sm">
+            <a href="/gpx-animation" className="font-semibold text-[var(--trail-orange)] hover:underline">GPX animation</a>
+            <a href="/strava-to-video" className="font-semibold text-[var(--trail-orange)] hover:underline">Strava to video</a>
+            <a href="/garmin-to-video" className="font-semibold text-[var(--trail-orange)] hover:underline">Garmin to video</a>
+            <a href="/cycling-route-animation" className="font-semibold text-[var(--trail-orange)] hover:underline">Cycling animation</a>
+            <a href="/running-route-animation" className="font-semibold text-[var(--trail-orange)] hover:underline">Running animation</a>
+          </div>
+        </section>
+
+        <footer className="border-t border-[var(--evergreen)]/12 pt-6 text-xs text-[var(--evergreen-60)]">
+          <a
+            href="https://bresca.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-semibold hover:text-[var(--trail-orange)] hover:underline"
+          >
+            {t('help.common.builtBy')}
+          </a>
+        </footer>
       </main>
     </div>
   );
@@ -104,6 +136,10 @@ function HeaderAction({ href, icon, label, tone = 'ghost' }: HelpHeaderAction) {
   return (
     <a
       href={href}
+      onClick={() => trackEvent('help_cta_clicked', {
+        cta_location: 'help_page',
+        target_page: href.includes('gpx-download-guide') ? 'gpx_guide' : 'tutorial',
+      })}
       className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold shadow-sm transition-colors ${className}`}
     >
       {icon}

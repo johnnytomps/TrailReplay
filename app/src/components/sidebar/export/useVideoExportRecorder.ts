@@ -1,12 +1,37 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import fixWebmDuration from 'fix-webm-duration';
 import { useAppStore } from '@/store/useAppStore';
+import { useComputedJourney } from '@/hooks/useComputedJourney';
 import { estimateFileSize } from '@/utils/videoExport';
 import { mapGlobalRef } from '@/utils/mapRef';
 import { useI18n } from '@/i18n/useI18n';
 import { getCropRegion } from '@/utils/crop';
-import { trackEvent } from '@/utils/analytics';
+import {
+  getBlobSizeBucket,
+  getDurationBucket,
+  getProgressBucket,
+  trackEvent,
+} from '@/utils/analytics';
 import { getActivityIconOption, isSvgActivityIcon } from '@/utils/activityIcons';
+import { getTriggeredPlaybackPictures } from '@/utils/playbackPictures';
+import { interpolateTrackPoint } from '@/utils/gpx/interpolateTrackPoint';
+import {
+  buildJourneyDistanceProfile,
+  getSegmentAtDistance,
+  getSegmentAtProgress,
+  getJourneyPointAtDistance,
+  getJourneyPointAtProgress,
+  type JourneyPoint,
+} from '@/utils/journeyUtils';
+import {
+  formatDistance,
+  formatElevation,
+  formatPace,
+  formatSpeedFromKmh,
+  formatStatsDuration,
+} from '@/utils/units';
+import { calculateCurrentLiveStats } from '@/components/stats/liveStats';
+import type { StatId } from '@/types';
 import {
   getSupportedMimeType,
   getVideoBitrate,
@@ -17,32 +42,20 @@ import {
   isWebCodecsMp4Supported,
   type Mp4CanvasEncoder,
 } from './mp4CanvasEncoder';
+import { getOverlayRefreshIntervalMs } from './exportOverlay';
+import { useExportOverlayCapture } from './useExportOverlayCapture';
+import { INTRO_DURATION, OUTRO_DELAY, OUTRO_DURATION } from '@/components/playback/PlaybackProvider';
 import {
-  getCapturedCanvasDrawSize,
-  getElevationOverlayDrawRect,
-  getExportOverlayMetrics,
-  getOverlayRefreshIntervalMs,
-  getPopupOverlayDrawRect,
-  getStatsOverlayDrawRect,
-  isDrawableRect,
-} from './exportOverlay';
+  getIntroCameraPose,
+  getOpeningPreloadProgresses,
+  getPlaybackCameraPose,
+  type ReplayCameraPose,
+} from '@/utils/replayCameraPlan';
 
-type Html2Canvas = (
-  element: HTMLElement,
-  options: {
-    backgroundColor: string | null;
-    scale: number;
-    logging: boolean;
-    useCORS: boolean;
-    allowTaint?: boolean;
-  }
-) => Promise<HTMLCanvasElement>;
-
-declare global {
-  interface Window {
-    html2canvas?: Html2Canvas;
-  }
-}
+const EXPORT_MAP_SETTLE_MS = 150;
+const EXPORT_TILE_PRELOAD_TIMEOUT_MS = 6000;
+const EXPORT_OPENING_WINDOW_MS = 20000;
+const EXPORT_OPENING_SAMPLE_COUNT = 8;
 
 function extractCssUrl(value: string): string | null {
   const match = value.match(/url\((['"]?)(.*?)\1\)/);
@@ -84,19 +97,40 @@ function drawTintedSvgIcon(
 export function useVideoExportRecorder() {
   const { t } = useI18n();
   const videoExportSettings = useAppStore((state) => state.videoExportSettings);
+  const visibleStats = useAppStore((state) => state.settings.visibleStats);
+  const showElevationProfile = useAppStore((state) => state.settings.showElevationProfile);
+  const mapStyle = useAppStore((state) => state.settings.mapStyle);
+  const show3DTerrain = useAppStore((state) => state.settings.show3DTerrain);
   const tracks = useAppStore((state) => state.tracks);
+  const pictures = useAppStore((state) => state.pictures);
+  const journeySegments = useAppStore((state) => state.journeySegments);
   const trailStyle = useAppStore((state) => state.settings.trailStyle);
+  const cameraSettings = useAppStore((state) => state.cameraSettings);
   const playback = useAppStore((state) => state.playback);
   const animationPhase = useAppStore((state) => state.animationPhase);
   const isExporting = useAppStore((state) => state.isExporting);
   const exportProgress = useAppStore((state) => state.exportProgress);
   const exportStage = useAppStore((state) => state.exportStage);
   const setIsExporting = useAppStore((state) => state.setIsExporting);
+  const setIsDeterministicExport = useAppStore((state) => state.setIsDeterministicExport);
   const setExportProgress = useAppStore((state) => state.setExportProgress);
   const setExportStage = useAppStore((state) => state.setExportStage);
   const resetPlayback = useAppStore((state) => state.resetPlayback);
+  const setSpeed = useAppStore((state) => state.setSpeed);
   const play = useAppStore((state) => state.play);
   const setCinematicPlayed = useAppStore((state) => state.setCinematicPlayed);
+  const {
+    activeTrack,
+    cameraPathCoordinates,
+    computedJourney,
+    elevationData,
+    segmentTimings,
+    totalDistance,
+  } = useComputedJourney();
+  const journeyDistanceProfile = useMemo(
+    () => computedJourney ? buildJourneyDistanceProfile(computedJourney.coordinates) : null,
+    [computedJourney],
+  );
 
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
 
@@ -108,7 +142,127 @@ export function useVideoExportRecorder() {
   );
   const actualFormat = videoExportSettings.format === 'mp4' && !mp4Supported ? 'webm' : videoExportSettings.format;
   const estimatedSize = estimateFileSize(playback.totalDuration, videoExportSettings);
+  const includeStats = visibleStats.length > 0;
+  const includeElevation = showElevationProfile;
   const overlayRefreshIntervalMs = useMemo(() => getOverlayRefreshIntervalMs(videoExportSettings.fps), [videoExportSettings.fps]);
+  const getStatsValues = useCallback((progress: number): Partial<Record<StatId, string>> => {
+    const state = useAppStore.getState();
+    const routeTimingMode = state.playback.routeTimingMode;
+    let journeyPosition: JourneyPoint | null = null;
+    if (computedJourney) {
+      journeyPosition = routeTimingMode === 'uniform' && journeyDistanceProfile
+        ? getJourneyPointAtDistance(
+            journeyDistanceProfile,
+            journeyDistanceProfile.totalDistance * progress,
+          )
+        : getJourneyPointAtProgress(progress, computedJourney.coordinates, segmentTimings);
+    } else if (activeTrack) {
+      const trackPosition = interpolateTrackPoint(activeTrack, activeTrack.totalDistance * progress);
+      if (trackPosition) {
+        journeyPosition = {
+          ...trackPosition,
+          segmentIndex: 0,
+          segmentType: 'track',
+          trackId: activeTrack.id,
+        };
+      }
+    }
+    if (!journeyPosition) return {};
+    const currentStats = calculateCurrentLiveStats({
+      activeTrack,
+      computedJourney,
+      currentPosition: journeyPosition,
+      playbackProgress: progress,
+      restartPerTrack: state.settings.journeyStatsMode === 'per-track',
+      segmentTimings,
+      totalDistance,
+      tracks: state.tracks,
+      videoDurationSeconds: state.playback.totalDuration / 1000,
+    });
+    const isInTransport = journeyPosition.segmentType === 'transport';
+    const values: Partial<Record<StatId, string>> = {};
+
+    state.settings.visibleStats.forEach((id) => {
+      switch (id) {
+        case 'duration':
+          values[id] = formatStatsDuration(currentStats.duration);
+          break;
+        case 'distance':
+          values[id] = formatDistance(currentStats.distance, state.settings.unitSystem);
+          break;
+        case 'pace':
+          values[id] = isInTransport
+            ? '--'
+            : formatPace(
+                state.settings.paceMode === 'per-km'
+                  ? currentStats.rollingSpeed
+                  : currentStats.averageSpeed,
+                state.settings.unitSystem,
+              );
+          break;
+        case 'elevation':
+          values[id] = isInTransport
+            ? '--'
+            : formatElevation(currentStats.elevationGain, state.settings.unitSystem);
+          break;
+        case 'speed':
+          values[id] = formatSpeedFromKmh(currentStats.currentSpeed, state.settings.unitSystem);
+          break;
+        case 'altitude':
+          values[id] = currentStats.altitude !== null
+            ? formatElevation(currentStats.altitude, state.settings.unitSystem)
+            : '--';
+          break;
+        case 'heartRate':
+          if (currentStats.heartRate) {
+            values[id] = `${Math.round(currentStats.heartRate)} ${t('stats.bpm')}`;
+          }
+          break;
+      }
+    });
+
+    return values;
+  }, [activeTrack, computedJourney, journeyDistanceProfile, segmentTimings, t, totalDistance]);
+  const getTrackLabel = useCallback((progress: number): { color: string; text: string } | null => {
+    const state = useAppStore.getState();
+    if (!state.settings.trailStyle.showTrackLabels) return null;
+
+    if (!computedJourney) {
+      return activeTrack
+        ? { color: state.settings.trailStyle.trailColor, text: activeTrack.name }
+        : null;
+    }
+
+    const currentSegment = state.playback.routeTimingMode === 'uniform' && journeyDistanceProfile
+      ? getSegmentAtDistance(
+          journeyDistanceProfile,
+          journeyDistanceProfile.totalDistance * progress,
+          segmentTimings,
+        )
+      : getSegmentAtProgress(progress, segmentTimings);
+    const trackId = currentSegment?.segment.type === 'track'
+      ? currentSegment.segment.trackId
+      : undefined;
+    const track = trackId ? state.tracks.find((candidate) => candidate.id === trackId) : null;
+    return track
+      ? { color: track.color || state.settings.trailStyle.trailColor, text: track.name }
+      : null;
+  }, [activeTrack, computedJourney, journeyDistanceProfile, segmentTimings]);
+  const {
+    cachedOverlayRef,
+    drawElevationProgress,
+    drawStatsValues,
+    loadHtml2Canvas,
+    overlayBusyRef,
+    overlayLastUpdateRef,
+    resetOverlayCapture,
+    updateOverlayAsync,
+  } = useExportOverlayCapture({
+    elevationData,
+    getStatsValues,
+    includeElevation,
+    includeStats,
+  });
 
   const recordingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const recordingContextRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -121,16 +275,9 @@ export function useVideoExportRecorder() {
   const useWebCodecsRef = useRef(false);
   const frameRequestRef = useRef<number | null>(null);
   const frameCleanupRef = useRef<(() => void) | null>(null);
-  const cachedOverlayRef = useRef<HTMLCanvasElement | null>(null);
-  const overlayBusyRef = useRef(false);
-  const overlayLastUpdateRef = useRef(0);
   const cachedLogoRef = useRef<HTMLImageElement | null>(null);
-  const html2CanvasLoaderRef = useRef<Promise<boolean> | null>(null);
-  const overlayRunIdRef = useRef(0);
   const svgMarkerImageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const pendingSvgMarkerLoadsRef = useRef<Set<string>>(new Set());
-
-  const html2canvas = useCallback(() => window.html2canvas ?? null, []);
 
   const preloadSvgMarkerIcon = useCallback((url: string) => {
     if (!url || svgMarkerImageCacheRef.current.has(url) || pendingSvgMarkerLoadsRef.current.has(url)) {
@@ -163,182 +310,6 @@ export function useVideoExportRecorder() {
       }
     });
   }, [preloadSvgMarkerIcon, tracks, trailStyle.currentIcon]);
-
-  const loadHtml2Canvas = useCallback(async (): Promise<boolean> => {
-    if (html2canvas()) return true;
-    if (html2CanvasLoaderRef.current) {
-      return html2CanvasLoaderRef.current;
-    }
-
-    html2CanvasLoaderRef.current = new Promise((resolve) => {
-      const existingScript = document.querySelector('script[data-trailreplay-html2canvas="true"]') as HTMLScriptElement | null;
-      if (existingScript) {
-        existingScript.addEventListener('load', () => resolve(true), { once: true });
-        existingScript.addEventListener('error', () => resolve(false), { once: true });
-        return;
-      }
-
-      const script = document.createElement('script');
-      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
-      script.crossOrigin = 'anonymous';
-      script.dataset.trailreplayHtml2canvas = 'true';
-      script.onload = () => resolve(true);
-      script.onerror = () => resolve(false);
-      document.head.appendChild(script);
-    });
-
-    return html2CanvasLoaderRef.current;
-  }, [html2canvas]);
-
-  const updateOverlayAsync = useCallback(async (recordW: number, recordH: number) => {
-    const capture = html2canvas();
-    if (overlayBusyRef.current || !capture) return;
-    const runId = overlayRunIdRef.current;
-    overlayBusyRef.current = true;
-    overlayLastUpdateRef.current = Date.now();
-
-    try {
-      const container = document.getElementById('map-capture-container');
-      if (!container) return;
-
-      const containerRect = container.getBoundingClientRect();
-      const { cropX, cropY, scaleToRecording, margin } = getExportOverlayMetrics(containerRect, recordW, recordH);
-
-      const overlay = document.createElement('canvas');
-      overlay.width = recordW;
-      overlay.height = recordH;
-      const overlayContext = overlay.getContext('2d');
-      if (!overlayContext) return;
-
-      if (videoExportSettings.includeStats) {
-        const statsElement = document.querySelector('.tr-stats-overlay') as HTMLElement | null;
-        if (statsElement) {
-          try {
-            const statsCaptureScale = 4;
-            const captureCanvas = await capture(statsElement, {
-              backgroundColor: null,
-              scale: statsCaptureScale,
-              logging: false,
-              useCORS: true,
-              allowTaint: true,
-            });
-            const { drawWidth, drawHeight } = getCapturedCanvasDrawSize(captureCanvas, scaleToRecording, statsCaptureScale);
-            const statsDrawRect = getStatsOverlayDrawRect({
-              captureCanvas: {
-                width: drawWidth,
-                height: drawHeight,
-              },
-              scaleToRecording: 1,
-              recordW,
-              recordH,
-              margin,
-            });
-            overlayContext.drawImage(
-              captureCanvas,
-              0,
-              0,
-              captureCanvas.width,
-              captureCanvas.height,
-              statsDrawRect.drawX,
-              statsDrawRect.drawY,
-              statsDrawRect.drawWidth,
-              statsDrawRect.drawHeight,
-            );
-          } catch {
-            // Skip overlay when capture fails.
-          }
-        }
-      }
-
-      if (videoExportSettings.includeElevation) {
-        const elevationElement = document.getElementById('mapElevationProfile') as HTMLElement | null;
-        if (elevationElement) {
-          try {
-            const captureCanvas = await capture(elevationElement, {
-              backgroundColor: null,
-              scale: 1,
-              logging: false,
-              useCORS: true,
-            });
-            const { drawX, drawY, drawWidth, drawHeight } = getElevationOverlayDrawRect({
-              captureCanvas,
-              scaleToRecording,
-              recordW,
-              recordH,
-              margin,
-            });
-            overlayContext.drawImage(captureCanvas, 0, 0, captureCanvas.width, captureCanvas.height, drawX, drawY, drawWidth, drawHeight);
-          } catch {
-            // Skip overlay when capture fails.
-          }
-        }
-      }
-
-      const picturePopupElement = document.querySelector('.tr-picture-popup') as HTMLElement | null;
-      if (picturePopupElement) {
-        try {
-          const popupRect = picturePopupElement.getBoundingClientRect();
-          const popupDrawRect = getPopupOverlayDrawRect({
-            popupRect,
-            containerRect,
-            cropX,
-            cropY,
-            scaleToRecording,
-          });
-
-          if (isDrawableRect(popupDrawRect)) {
-            const captureCanvas = await capture(picturePopupElement, {
-              backgroundColor: null,
-              scale: 1,
-              logging: false,
-              useCORS: true,
-              allowTaint: true,
-            });
-            overlayContext.drawImage(
-              captureCanvas,
-              0,
-              0,
-              captureCanvas.width,
-              captureCanvas.height,
-              popupDrawRect.drawX,
-              popupDrawRect.drawY,
-              popupDrawRect.drawWidth,
-              popupDrawRect.drawHeight
-            );
-
-            const popupImageElement = picturePopupElement.querySelector('img') as HTMLImageElement | null;
-            if (popupImageElement && popupImageElement.complete && popupImageElement.naturalWidth > 0) {
-              const imageRect = popupImageElement.getBoundingClientRect();
-              const imageDrawRect = getPopupOverlayDrawRect({
-                popupRect: imageRect,
-                containerRect,
-                cropX,
-                cropY,
-                scaleToRecording,
-              });
-              if (isDrawableRect(imageDrawRect)) {
-                overlayContext.drawImage(
-                  popupImageElement,
-                  imageDrawRect.drawX,
-                  imageDrawRect.drawY,
-                  imageDrawRect.drawWidth,
-                  imageDrawRect.drawHeight
-                );
-              }
-            }
-          }
-        } catch {
-          // Skip popup capture when unavailable.
-        }
-      }
-
-      if (runId === overlayRunIdRef.current) {
-        cachedOverlayRef.current = overlay;
-      }
-    } finally {
-      overlayBusyRef.current = false;
-    }
-  }, [html2canvas, videoExportSettings.includeElevation, videoExportSettings.includeStats]);
 
   const captureFrame = useCallback(() => {
     if (!recordingCanvasRef.current || !recordingContextRef.current) return;
@@ -375,11 +346,69 @@ export function useVideoExportRecorder() {
       context.drawImage(cachedOverlayRef.current, 0, 0, recordW, recordH);
     }
 
-    const markerContainer = document.querySelector('.tr-marker') as HTMLElement | null;
+    const scaleX = recordW / cropW;
+    const scaleY = recordH / cropH;
+
+    // The static elevation profile remains in the cached DOM snapshot, while
+    // its progress fill and label are cheap native-canvas primitives. Drawing
+    // only those moving pieces here keeps them at the actual video frame rate
+    // without running html2canvas 30 or 60 times per second.
+    drawStatsValues(context, {
+      containerRect,
+      cropX,
+      cropY,
+      recordW,
+      recordH,
+      scaleToRecording: scaleX,
+    });
+    drawElevationProgress(context, {
+      recordW,
+      recordH,
+      scaleToRecording: scaleX,
+    });
+
+    // The photo popup should read as fully in front of everything else
+    // (matching the live view's z-index stacking): neither the route
+    // position marker nor the small photo-pin markers should paint over it.
+    const pictureHoldActive = Boolean(document.querySelector('.tr-picture-popup'));
+
+    // Photo pin markers along the route (`usePictureMarkers.ts`) live as
+    // MapLibre DOM markers outside the WebGL canvas, so — like the position
+    // marker below — they need to be manually recreated here or they never
+    // appear in the exported video at all.
+    if (!pictureHoldActive) document.querySelectorAll('.tr-picture-marker').forEach((markerEl) => {
+      const rect = (markerEl as HTMLElement).getBoundingClientRect();
+      const centerX = (rect.left + rect.width / 2 - containerRect.left - cropX) * scaleX;
+      const centerY = (rect.top + rect.height / 2 - containerRect.top - cropY) * scaleY;
+      const radius = (rect.width / 2) * scaleX;
+      if (radius <= 0) return;
+      if (centerX < -radius || centerX > recordW + radius || centerY < -radius || centerY > recordH + radius) return;
+
+      const computed = getComputedStyle(markerEl as HTMLElement);
+      context.save();
+      context.beginPath();
+      context.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      context.closePath();
+      context.fillStyle = computed.backgroundColor || 'rgba(255, 152, 0, 0.9)';
+      context.fill();
+
+      const thumb = markerEl.querySelector('img') as HTMLImageElement | null;
+      if (thumb && thumb.complete && thumb.naturalWidth > 0) {
+        context.clip();
+        context.drawImage(thumb, centerX - radius, centerY - radius, radius * 2, radius * 2);
+      }
+      context.restore();
+
+      context.beginPath();
+      context.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      context.lineWidth = (parseFloat(computed.borderWidth) || 3) * scaleX;
+      context.strokeStyle = computed.borderColor || '#ffffff';
+      context.stroke();
+    });
+
+    const markerContainer = pictureHoldActive ? null : document.querySelector('.tr-marker') as HTMLElement | null;
     if (markerContainer) {
       const markerRect = markerContainer.getBoundingClientRect();
-      const scaleX = recordW / cropW;
-      const scaleY = recordH / cropH;
       const markerX = (markerRect.left + markerRect.width / 2 - containerRect.left - cropX) * scaleX;
       const markerY = (markerRect.top + markerRect.height / 2 - containerRect.top - cropY) * scaleY;
 
@@ -428,12 +457,35 @@ export function useVideoExportRecorder() {
           context.fillText(markerIcon.textContent, markerX, markerY);
         }
       }
+
+      const trackLabel = getTrackLabel(useAppStore.getState().playback.progress);
+      if (trackLabel?.text) {
+        const labelFontSize = 12 * scaleY;
+        const markerTop = markerY - (markerRect.height / 2) * scaleY;
+
+        context.save();
+        context.font = `700 ${labelFontSize}px JetBrains Mono, monospace`;
+        context.textAlign = 'center';
+        context.textBaseline = 'bottom';
+        context.lineJoin = 'round';
+        context.strokeStyle = '#ffffff';
+        context.lineWidth = 3 * scaleY;
+        context.strokeText(trackLabel.text, markerX, markerTop - 8 * scaleY);
+        context.fillStyle = trackLabel.color;
+        context.fillText(trackLabel.text, markerX, markerTop - 8 * scaleY);
+        context.restore();
+      }
     }
 
     if (cachedLogoRef.current) {
-      const logoWidth = Math.round(recordW * 0.14);
+      // Size relative to the long edge (fixed per quality level regardless
+      // of aspect ratio - see getResolution), not the frame width. Basing it
+      // on width alone made the watermark shrink drastically for portrait
+      // (9:16) and square exports, since their width is the *short* edge.
+      const longEdge = Math.max(recordW, recordH);
+      const logoWidth = Math.round(longEdge * 0.16);
       const logoHeight = Math.round(logoWidth / 2.5);
-      const margin = Math.round(recordW * 0.025);
+      const margin = Math.round(longEdge * 0.025);
       const logoX = recordW - logoWidth - margin;
       const logoY = margin;
       context.save();
@@ -445,14 +497,14 @@ export function useVideoExportRecorder() {
     if (Date.now() - overlayLastUpdateRef.current >= overlayRefreshIntervalMs && !overlayBusyRef.current) {
       updateOverlayAsync(recordW, recordH);
     }
-  }, [overlayRefreshIntervalMs, preloadSvgMarkerIcon, updateOverlayAsync, videoExportSettings.resolution]);
+  }, [cachedOverlayRef, drawElevationProgress, drawStatsValues, getTrackLabel, overlayBusyRef, overlayLastUpdateRef, overlayRefreshIntervalMs, preloadSvgMarkerIcon, updateOverlayAsync, videoExportSettings.resolution]);
 
   // When encoding via WebCodecs, push the freshly drawn canvas to the encoder.
   // No-op for the MediaRecorder path, which samples the canvas stream itself.
-  const encodeWebCodecsFrame = useCallback(() => {
+  const encodeWebCodecsFrame = useCallback(async (timestampMicros?: number) => {
     if (!useWebCodecsRef.current || !mp4EncoderRef.current || !recordingCanvasRef.current) return;
-    const elapsedMicros = (performance.now() - recordingStartTimeRef.current) * 1000;
-    mp4EncoderRef.current.encodeCanvas(recordingCanvasRef.current, elapsedMicros);
+    const elapsedMicros = timestampMicros ?? (performance.now() - recordingStartTimeRef.current) * 1000;
+    await mp4EncoderRef.current.encodeCanvas(recordingCanvasRef.current, elapsedMicros);
   }, []);
 
   const startFrameCapture = useCallback(() => {
@@ -466,7 +518,7 @@ export function useVideoExportRecorder() {
         const now = performance.now();
         if (now - lastCaptureTime >= targetFrameInterval) {
           captureFrame();
-          encodeWebCodecsFrame();
+          void encodeWebCodecsFrame();
           lastCaptureTime = now;
         }
         frameRequestRef.current = requestAnimationFrame(captureLoop);
@@ -480,7 +532,7 @@ export function useVideoExportRecorder() {
       const now = performance.now();
       if (now - lastCaptureTime >= targetFrameInterval) {
         captureFrame();
-        encodeWebCodecsFrame();
+        void encodeWebCodecsFrame();
         lastCaptureTime = now;
       }
     };
@@ -496,6 +548,154 @@ export function useVideoExportRecorder() {
     frameRequestRef.current = requestAnimationFrame(keepRendering);
   }, [captureFrame, encodeWebCodecsFrame, videoExportSettings.fps]);
 
+  const waitForMapFrame = useCallback(async () => {
+    // Let React commit the new replay state, then wait for MapLibre to draw it.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const map = mapGlobalRef.current;
+    if (!map) return;
+
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+      const finish = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+      map.once('render', finish);
+      map.triggerRepaint();
+      // A render event is normally immediate. Keep export cancellable if a map
+      // implementation declines to render while its style is changing.
+      requestAnimationFrame(() => requestAnimationFrame(finish));
+    });
+  }, []);
+
+  const preloadExportOpeningTiles = useCallback(async () => {
+    const map = mapGlobalRef.current;
+    if (!map || cameraSettings.mode === 'overview' || cameraPathCoordinates.length === 0) return;
+
+    const routeDurationMs = useAppStore.getState().playback.totalDuration || 60_000;
+    // Tile prefetch has no cinematic-specific pose logic yet — approximate
+    // with follow-behind, which sits at a similar zoom/pitch. The actual
+    // export render loop (useTrailPlaybackCamera) does use the real
+    // cinematic poses, so this only affects which tiles get warmed early.
+    const poseCameraMode = cameraSettings.mode === 'cinematic' ? 'follow-behind' : cameraSettings.mode;
+    const introPose = getIntroCameraPose({
+      cameraMode: poseCameraMode,
+      coordinates: cameraPathCoordinates,
+      elevationData,
+      followBehindZoomLevel: cameraSettings.followBehindZoomLevel,
+      progress: 0,
+    });
+    const poses = [
+      introPose,
+      ...getOpeningPreloadProgresses(
+        routeDurationMs,
+        EXPORT_OPENING_WINDOW_MS,
+        EXPORT_OPENING_SAMPLE_COUNT,
+      ).map((progress) => getPlaybackCameraPose({
+        cameraMode: poseCameraMode,
+        coordinates: cameraPathCoordinates,
+        elevationData,
+        followBehindZoomLevel: cameraSettings.followBehindZoomLevel,
+        progress,
+      })),
+    ].filter((pose): pose is ReplayCameraPose => pose !== null);
+
+    const overview = {
+      center: map.getCenter(),
+      zoom: map.getZoom(),
+      pitch: map.getPitch(),
+      bearing: map.getBearing(),
+    };
+    const deadline = Date.now() + EXPORT_TILE_PRELOAD_TIMEOUT_MS;
+
+    for (const pose of poses) {
+      if (recordingCancelledRef.current || Date.now() >= deadline) break;
+      map.jumpTo(pose);
+      await new Promise<void>((resolve) => {
+        let complete = false;
+        const finish = () => {
+          if (complete) return;
+          complete = true;
+          map.off('idle', finish);
+          resolve();
+        };
+        map.once('idle', finish);
+        window.setTimeout(finish, Math.max(0, deadline - Date.now()));
+      });
+    }
+
+    map.jumpTo(overview);
+    await waitForMapFrame();
+  }, [cameraPathCoordinates, cameraSettings.followBehindZoomLevel, cameraSettings.mode, elevationData, waitForMapFrame]);
+
+  const captureDeterministicPhase = useCallback(async (
+    durationMs: number,
+    timestampOffsetMs: number,
+  ) => {
+    const frameDurationMs = 1000 / videoExportSettings.fps;
+    const frameCount = Math.max(1, Math.ceil(durationMs / frameDurationMs));
+    const phaseStartTime = performance.now();
+
+    for (let frameIndex = 0; frameIndex <= frameCount; frameIndex += 1) {
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+      await waitForMapFrame();
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+      captureFrame();
+      await encodeWebCodecsFrame((timestampOffsetMs + (frameIndex * frameDurationMs)) * 1000);
+      if (frameIndex < frameCount) {
+        // Map rendering already consumes part of this frame's budget. Waiting a
+        // full additional frame interval made the intro/outro take roughly twice
+        // as long to export, while the encoded timestamps and pixels stayed the
+        // same. Only wait for the remainder needed to preserve their timeline.
+        const nextFrameDueAt = phaseStartTime + ((frameIndex + 1) * frameDurationMs);
+        const remainingDelayMs = Math.max(0, nextFrameDueAt - performance.now());
+        if (remainingDelayMs > 0) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, remainingDelayMs));
+        }
+      }
+    }
+  }, [captureFrame, encodeWebCodecsFrame, videoExportSettings.fps, waitForMapFrame]);
+
+  // Holds on a picture popup for `durationMs`, forcing a fresh DOM-overlay
+  // capture every single encoded frame instead of the ~12fps throttle
+  // `captureFrame` otherwise applies (see `getOverlayRefreshIntervalMs`) —
+  // that throttle is fine for slow-moving stats/elevation overlays, but made
+  // the popup's zoom/opacity transition look stepped and laggy since it was
+  // only being re-rasterized a handful of times over its whole animation.
+  // The route position/camera stay frozen throughout (only
+  // `exportPictureHoldElapsedMs` advances), so there's no need for the map
+  // to actually repaint each frame the way `captureDeterministicPhase` waits
+  // for — that lets this run faster too.
+  const capturePictureHold = useCallback(async (
+    durationMs: number,
+    timestampOffsetMs: number,
+  ) => {
+    const frameDurationMs = 1000 / videoExportSettings.fps;
+    const frameCount = Math.max(1, Math.ceil(durationMs / frameDurationMs));
+    const { width: recordW, height: recordH } = videoExportSettings.resolution;
+    const phaseStartTime = performance.now();
+
+    for (let frameIndex = 0; frameIndex <= frameCount; frameIndex += 1) {
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+      useAppStore.getState().setExportPictureHoldElapsedMs(frameIndex * frameDurationMs);
+      // Let React commit the new elapsed value (and the popup's CSS
+      // transition tick forward in the DOM) before rasterizing it.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+      await updateOverlayAsync(recordW, recordH);
+      captureFrame();
+      await encodeWebCodecsFrame((timestampOffsetMs + (frameIndex * frameDurationMs)) * 1000);
+      if (frameIndex < frameCount) {
+        const nextFrameDueAt = phaseStartTime + ((frameIndex + 1) * frameDurationMs);
+        const remainingDelayMs = Math.max(0, nextFrameDueAt - performance.now());
+        if (remainingDelayMs > 0) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, remainingDelayMs));
+        }
+      }
+    }
+  }, [captureFrame, encodeWebCodecsFrame, updateOverlayAsync, videoExportSettings.fps, videoExportSettings.resolution]);
+
   // Flush and download the WebCodecs-encoded MP4 once recording has stopped.
   const finalizeWebCodecsExport = useCallback(async () => {
     const encoder = mp4EncoderRef.current;
@@ -506,6 +706,7 @@ export function useVideoExportRecorder() {
     if (recordingCancelledRef.current) {
       encoder.close();
       setIsExporting(false);
+      resetPlayback();
       return;
     }
 
@@ -516,8 +717,10 @@ export function useVideoExportRecorder() {
         setExportStage(t('export.stageComplete'));
         setExportProgress(100);
         trackEvent('export_completed', {
-          export_blob_size: blob.size,
+          export_blob_size_bucket: getBlobSizeBucket(blob.size),
           export_format: 'mp4',
+          export_encoder_path: 'webcodecs',
+          export_duration_bucket: getDurationBucket(playback.totalDuration),
         });
 
         const url = URL.createObjectURL(blob);
@@ -528,16 +731,28 @@ export function useVideoExportRecorder() {
         URL.revokeObjectURL(url);
       } else {
         setExportStage(t('export.stageFailedNoData'));
-        trackEvent('export_failed', { export_failure_scope: 'no_data' });
+        trackEvent('export_failed', {
+          export_failure_scope: 'no_data',
+          export_format: 'mp4',
+          export_encoder_path: 'webcodecs',
+        });
       }
     } catch (error) {
       console.error('WebCodecs export failed', error);
       setExportStage(t('export.stageFailedWithError', { error: (error as Error).message }));
-      trackEvent('export_failed', { export_failure_scope: 'encoder_finalize' });
+      trackEvent('export_failed', {
+        export_failure_scope: 'encoder_finalize',
+        export_format: 'mp4',
+        export_encoder_path: 'webcodecs',
+      });
     } finally {
+      setIsDeterministicExport(false);
       setIsExporting(false);
+      // Deterministic export drives the animation directly through its outro.
+      // Restore an idle, replayable timeline once the file has been finalized.
+      resetPlayback();
     }
-  }, [setExportProgress, setExportStage, setIsExporting, t]);
+  }, [playback.totalDuration, resetPlayback, setExportProgress, setExportStage, setIsDeterministicExport, setIsExporting, t]);
 
   const finishRecording = useCallback(() => {
     if (!isRecordingRef.current) return;
@@ -574,6 +789,107 @@ export function useVideoExportRecorder() {
       recorder.stop();
     }
   }, [finalizeWebCodecsExport, setExportStage, t]);
+
+  const runDeterministicExport = useCallback(async () => {
+    if (!mp4EncoderRef.current) return;
+
+    const { fps } = videoExportSettings;
+    const frameDurationMs = 1000 / fps;
+    const store = useAppStore.getState();
+    const routeDurationMs = store.playback.totalDuration;
+    // Preview speed only affects interactive playback. Export always preserves
+    // the configured journey duration on the encoded timeline.
+    const frameCount = Math.ceil(routeDurationMs / frameDurationMs);
+    const progressUpdateInterval = Math.max(1, Math.round(fps / 5));
+
+    setIsDeterministicExport(true);
+    store.setPlayback({ isPlaying: true, currentTime: 0, progress: 0 });
+    // Start the cinematic movement first and wait for its first rendered frame.
+    // This ensures the video begins from the actual introductory camera pose,
+    // rather than catching the map halfway through a state transition.
+    store.setCinematicPlayed(false);
+    store.setAnimationPhase('intro');
+    await waitForMapFrame();
+    await captureDeterministicPhase(INTRO_DURATION, 0);
+
+    if (!isRecordingRef.current || recordingCancelledRef.current) return;
+
+    store.setCinematicPlayed(true);
+    store.setAnimationPhase('playing');
+    let encodedDurationMs = INTRO_DURATION;
+    // Mirrors App.tsx's live-playback picture trigger (`getTriggeredPlaybackPictures`),
+    // but drives its own hold here so the export can freeze the route
+    // position for the picture's full `displayDuration` instead of just
+    // showing the popup over an already-advancing timeline.
+    const shownPictureIds = new Set<string>();
+    let previousProgress = 0;
+
+    // The intro already contains the progress-zero pose. Begin at the first
+    // advancing route frame so the cut into the route has no duplicate hold.
+    for (let frameIndex = 1; frameIndex <= frameCount; frameIndex += 1) {
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+
+      const currentTime = Math.min(routeDurationMs, frameIndex * frameDurationMs);
+      const progress = routeDurationMs > 0 ? currentTime / routeDurationMs : 1;
+      useAppStore.getState().setPlayback({ currentTime, progress });
+      await waitForMapFrame();
+
+      if (!isRecordingRef.current || recordingCancelledRef.current) break;
+      captureFrame();
+      // Match the original `(fixedBase + frameIndex * frameDurationMs)`
+      // timestamp math exactly: increment before encoding, so frame 1 lands
+      // at `INTRO_DURATION + frameDurationMs`, not `INTRO_DURATION` (which
+      // would collide with the intro phase's own last encoded timestamp).
+      encodedDurationMs += frameDurationMs;
+      await encodeWebCodecsFrame(encodedDurationMs * 1000);
+
+      if (frameIndex % progressUpdateInterval === 0 || frameIndex === frameCount) {
+        setExportProgress(progress * 100);
+        setExportStage(t('export.recording'));
+      }
+
+      const triggeredPictures = getTriggeredPlaybackPictures({
+        pictures,
+        previousProgress,
+        currentProgress: progress,
+        shownPictureIds,
+        queuedPictureIds: [],
+      });
+      previousProgress = progress;
+
+      for (const picture of triggeredPictures) {
+        if (!isRecordingRef.current || recordingCancelledRef.current) break;
+        shownPictureIds.add(picture.id);
+        store.setSelectedPictureId(picture.id);
+        const holdTimestampOffset = encodedDurationMs;
+        const holdDurationMs = picture.displayDuration || 5000;
+        // `progress`/`currentTime` are left untouched for the whole hold, so
+        // the map/marker stay frozen; only `exportPictureHoldElapsedMs`
+        // advances, driving the popup's own zoom/progress-bar animation.
+        await capturePictureHold(holdDurationMs, holdTimestampOffset);
+        encodedDurationMs = holdTimestampOffset + holdDurationMs;
+        store.setSelectedPictureId(null);
+        store.setExportPictureHoldElapsedMs(null);
+      }
+    }
+
+    if (!recordingCancelledRef.current && isRecordingRef.current) {
+      // Mirror the on-screen finale: a short hold at the finish, then the
+      // outward camera move. Both are encoded before the file is finalized.
+      store.setPlayback({ isPlaying: false, currentTime: routeDurationMs, progress: 1 });
+      if (OUTRO_DELAY > 0) {
+        store.setAnimationPhase('playing');
+        await captureDeterministicPhase(OUTRO_DELAY, encodedDurationMs);
+        encodedDurationMs += OUTRO_DELAY;
+      }
+
+      if (!isRecordingRef.current || recordingCancelledRef.current) return;
+      store.setAnimationPhase('outro');
+      await captureDeterministicPhase(OUTRO_DURATION, encodedDurationMs);
+    }
+
+    if (!recordingCancelledRef.current) finishRecording();
+  }, [captureDeterministicPhase, capturePictureHold, captureFrame, encodeWebCodecsFrame, finishRecording, pictures, setExportProgress, setExportStage, setIsDeterministicExport, t, videoExportSettings, waitForMapFrame]);
 
   useEffect(() => {
     if (!isRecordingRef.current) return;
@@ -620,6 +936,7 @@ export function useVideoExportRecorder() {
       // A cancelled export still fires onstop; don't save or download it.
       if (recordingCancelledRef.current) {
         setIsExporting(false);
+        resetPlayback();
         return;
       }
       let blob = new Blob(recordedChunksRef.current, { type: mimeType });
@@ -645,8 +962,10 @@ export function useVideoExportRecorder() {
         setExportStage(t('export.stageComplete'));
         setExportProgress(100);
         trackEvent('export_completed', {
-          export_blob_size: blob.size,
+          export_blob_size_bucket: getBlobSizeBucket(blob.size),
           export_format: extension,
+          export_encoder_path: 'mediarecorder',
+          export_duration_bucket: getDurationBucket(playback.totalDuration),
         });
 
         const url = URL.createObjectURL(blob);
@@ -659,9 +978,14 @@ export function useVideoExportRecorder() {
         setExportStage(t('export.stageFailedNoData'));
         trackEvent('export_failed', {
           export_failure_scope: 'no_data',
+          export_format: extension,
+          export_encoder_path: 'mediarecorder',
         });
       }
       setIsExporting(false);
+      // The screen-recording fallback completes after the normal animation has
+      // reached its finale. Reset so the next Play starts a fresh replay.
+      resetPlayback();
     };
 
     recorder.onerror = (event) => {
@@ -671,6 +995,8 @@ export function useVideoExportRecorder() {
       console.error('MediaRecorder error during export', event);
       trackEvent('export_failed', {
         export_failure_scope: 'recorder_error',
+        export_format: recordedFormat,
+        export_encoder_path: 'mediarecorder',
       });
       if (frameCleanupRef.current) {
         frameCleanupRef.current();
@@ -687,7 +1013,7 @@ export function useVideoExportRecorder() {
     };
 
     recorder.start(100);
-  }, [setExportProgress, setExportStage, setIsExporting, t, videoExportSettings]);
+  }, [playback.totalDuration, resetPlayback, setExportProgress, setExportStage, setIsExporting, t, videoExportSettings]);
 
   const handleStartExport = useCallback(async () => {
     const mapCanvas = document.querySelector('.maplibregl-canvas') as HTMLCanvasElement | null;
@@ -702,18 +1028,29 @@ export function useVideoExportRecorder() {
     setExportedBlob(null);
     recordedChunksRef.current = [];
     recordingCancelledRef.current = false;
+    setIsDeterministicExport(false);
     useWebCodecsRef.current = false;
     mp4EncoderRef.current = null;
-    cachedOverlayRef.current = null;
-    overlayBusyRef.current = false;
-    overlayLastUpdateRef.current = 0;
-    overlayRunIdRef.current += 1;
+    resetOverlayCapture();
     trackEvent('export_started', {
       export_format: actualFormat,
       export_quality: videoExportSettings.quality,
       export_fps: videoExportSettings.fps,
-      export_include_stats: videoExportSettings.includeStats,
-      export_include_elevation: videoExportSettings.includeElevation,
+      export_aspect_ratio: videoExportSettings.aspectRatio,
+      export_include_stats: includeStats,
+      export_include_elevation: includeElevation,
+      export_duration_bucket: getDurationBucket(playback.totalDuration),
+      track_count: tracks.length,
+      picture_count: pictures.length,
+      journey_segment_count: journeySegments.length,
+      camera_mode: cameraSettings.mode,
+      camera_preset: cameraSettings.mode === 'follow-behind' ? cameraSettings.followBehindPreset : 'not_applicable',
+      // How much of the cinematic camera was actually authored, so exports
+      // can be told apart from ones that only visited the mode.
+      cinematic_keyframe_count: useAppStore.getState().cinematicCameraKeyframes.length,
+      transport_segment_count: journeySegments.filter((segment) => segment.type === 'transport').length,
+      map_style: mapStyle,
+      terrain_3d_enabled: show3DTerrain,
     });
 
     try {
@@ -745,10 +1082,17 @@ export function useVideoExportRecorder() {
       await updateOverlayAsync(width, height);
 
       setExportStage(t('export.stageResetting'));
+      const exportSpeed = useAppStore.getState().playback.speed;
       resetPlayback();
+      setSpeed(exportSpeed);
       setCinematicPlayed(false);
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      setExportStage(t('export.stagePreparing'));
+      await preloadExportOpeningTiles();
+
+      // Let MapLibre complete its reset pose before starting the intro and its
+      // first encoded frame. This avoids a recording that begins mid-reframe.
+      await new Promise((resolve) => setTimeout(resolve, EXPORT_MAP_SETTLE_MS));
 
       setExportStage(t('export.stageSetupRecorder'));
 
@@ -779,18 +1123,29 @@ export function useVideoExportRecorder() {
       recordingStartTimeRef.current = performance.now();
       isRecordingRef.current = true;
 
-      startFrameCapture();
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
       setExportStage(t('export.stageRecordingAnimation'));
-      play();
+      if (useWebCodecsRef.current) {
+        void runDeterministicExport().catch((error) => {
+          console.error('Deterministic export failed', error);
+          setExportStage(t('export.stageFailedWithError', { error: (error as Error).message }));
+          finishRecording();
+        });
+      } else {
+        startFrameCapture();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        play();
+      }
     } catch (error) {
       console.error('Export failed:', error);
       trackEvent('export_failed', {
         export_failure_scope: 'setup',
+        export_format: actualFormat,
+        export_encoder_path: useWebCodecsRef.current ? 'webcodecs' : 'unknown',
       });
       setExportStage(t('export.stageFailedWithError', { error: (error as Error).message }));
       setIsExporting(false);
+      setIsDeterministicExport(false);
+      resetPlayback();
       isRecordingRef.current = false;
       if (mp4EncoderRef.current) {
         mp4EncoderRef.current.close();
@@ -798,14 +1153,13 @@ export function useVideoExportRecorder() {
       }
       useWebCodecsRef.current = false;
     }
-  }, [actualFormat, loadHtml2Canvas, play, resetPlayback, setCinematicPlayed, setExportProgress, setExportStage, setIsExporting, setupMediaRecorderFallback, startFrameCapture, t, updateOverlayAsync, videoExportSettings]);
+  }, [actualFormat, finishRecording, includeElevation, includeStats, journeySegments.length, loadHtml2Canvas, pictures.length, play, playback.totalDuration, preloadExportOpeningTiles, resetOverlayCapture, resetPlayback, runDeterministicExport, setCinematicPlayed, setExportProgress, setExportStage, setIsDeterministicExport, setIsExporting, setSpeed, setupMediaRecorderFallback, startFrameCapture, t, tracks.length, updateOverlayAsync, videoExportSettings]);
 
   const handleCancelExport = useCallback(() => {
+    const exportEncoderPath = useWebCodecsRef.current ? 'webcodecs' : 'mediarecorder';
     isRecordingRef.current = false;
     recordingCancelledRef.current = true;
-    cachedOverlayRef.current = null;
-    overlayBusyRef.current = false;
-    overlayRunIdRef.current += 1;
+    resetOverlayCapture();
 
     if (frameCleanupRef.current) {
       frameCleanupRef.current();
@@ -822,16 +1176,18 @@ export function useVideoExportRecorder() {
       mp4EncoderRef.current = null;
     }
     useWebCodecsRef.current = false;
+    setIsDeterministicExport(false);
 
     trackEvent('export_cancelled', {
-      export_progress_percent: exportProgress,
-      export_stage: exportStage,
+      export_progress_bucket: getProgressBucket(exportProgress),
+      export_format: actualFormat,
+      export_encoder_path: exportEncoderPath,
     });
     setIsExporting(false);
     setExportProgress(0);
     setExportStage('');
     resetPlayback();
-  }, [exportProgress, exportStage, resetPlayback, setExportProgress, setExportStage, setIsExporting]);
+  }, [actualFormat, exportProgress, resetOverlayCapture, resetPlayback, setExportProgress, setExportStage, setIsDeterministicExport, setIsExporting]);
 
   const handleDownload = useCallback(() => {
     if (!exportedBlob) return;
@@ -843,6 +1199,7 @@ export function useVideoExportRecorder() {
     anchor.download = `trail-replay-${Date.now()}.${extension}`;
     anchor.click();
     URL.revokeObjectURL(url);
+    trackEvent('export_downloaded_again', { export_format: extension });
   }, [exportedBlob]);
 
   const resetExportResult = useCallback(() => {
