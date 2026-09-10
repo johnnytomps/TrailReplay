@@ -2,7 +2,12 @@ import { createElement } from 'react';
 import type { CSSProperties, ReactElement } from 'react';
 
 export const PNG_ACTIVITY_ICON_VALUES = {
-  rafting: 'png-rafting'
+  packraft: 'png-packraft',
+  bike: 'png-bike',
+  ctabus: 'png-ctabus',
+  ctatrain: 'png-ctatrain',
+  metratrain: 'png-metratrain',
+  pacebus: 'png-pacebus',
 } as const;
 
 export const SVG_ACTIVITY_ICON_VALUES = {
@@ -24,7 +29,12 @@ type ActivityIconOption = {
 const svgIconBasePath = '/media/images/activity-icons';
 
 export const ACTIVITY_ICONS: ActivityIconOption[] = [
-  { value: PNG_ACTIVITY_ICON_VALUES.rafting, labelKey: 'rafting', kind: 'png', content: `${svgIconBasePath}/rafting.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.packraft, labelKey: 'Packraft', kind: 'png', content: `${svgIconBasePath}/packraft.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.bike, labelKey: 'Bike', kind: 'png', content: `${svgIconBasePath}/bike.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.ctabus, labelKey: 'CTA Bus', kind: 'png', content: `${svgIconBasePath}/cta-bus.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.ctatrain, labelKey: 'CTA Train', kind: 'png', content: `${svgIconBasePath}/cta-train.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.metratrain, labelKey: 'Metra Train', kind: 'png', content: `${svgIconBasePath}/metra-train.png` },
+  { value: PNG_ACTIVITY_ICON_VALUES.pacebus, labelKey: 'Pace', kind: 'png', content: `${svgIconBasePath}/pace-bus.png` },
   { value: SVG_ACTIVITY_ICON_VALUES.walking, labelKey: 'activities.walking', kind: 'svg', content: `${svgIconBasePath}/walking.svg` },
   { value: SVG_ACTIVITY_ICON_VALUES.running, labelKey: 'activities.running', kind: 'svg', content: `${svgIconBasePath}/running.svg` },
   { value: SVG_ACTIVITY_ICON_VALUES.biking, labelKey: 'activities.cycling', kind: 'svg', content: `${svgIconBasePath}/biking.svg` },
@@ -95,6 +105,10 @@ export function isSvgActivityIcon(value: string): boolean {
   return getActivityIconOption(value)?.kind === 'svg';
 }
 
+export function isPngActivityIcon(value: string): boolean {
+  return getActivityIconOption(value)?.kind === 'png';
+}
+
 export function renderActivityIcon(
   value: string,
   options: { size?: number; className?: string; color?: string } = {},
@@ -114,8 +128,11 @@ export function renderActivityIcon(
 
   if (icon?.kind === 'png') {
     return createElement('img', {
+      'aria-hidden': true,
+      alt: '',
       className,
       src: icon.content,
+      style: iconFrameStyle(size),
     });
   }
 
@@ -146,7 +163,7 @@ export function getActivityIconMarkerHtml(value: string, size: number, color: st
   }
 
   if (icon?.kind === 'png') {
-    return `<span john="hi" aria-hidden="true" style="width:${size}px;height:${size}px;display:block;position:relative;z-index:10;"><img src="${escapeHtml(icon.content)}"></span>`;
+    return `<span aria-hidden="true" style="width:${size}px;height:${size}px;display:block;position:relative;z-index:10;"><img src="${escapeHtml(icon.content)}" alt="" style="width:100%;height:100%;display:block;object-fit:contain;"></span>`;
   }
 
   return `<span style="width:${size}px;height:${size}px;display:inline-flex;align-items:center;justify-content:center;font-size:${size}px;line-height:1;position:relative;z-index:10;">${escapeHtml(icon?.content ?? value)}</span>`;

@@ -12,7 +12,8 @@ import {
   getProgressBucket,
   trackEvent,
 } from '@/utils/analytics';
-import { getActivityIconOption, isSvgActivityIcon } from '@/utils/activityIcons';
+import { getActivityIconOption } from '@/utils/activityIcons';
+import { getContainedSize } from '@/utils/imageFit';
 import { getTriggeredPlaybackPictures } from '@/utils/playbackPictures';
 import { interpolateTrackPoint } from '@/utils/gpx/interpolateTrackPoint';
 import {
@@ -73,9 +74,17 @@ function drawTintedSvgIcon(
     width: number;
   },
 ) {
+  // `mask-size: contain` on the DOM marker preserves the glyph's aspect ratio,
+  // so the tinted copy has to be letterboxed into the box the same way.
+  const drawn = getContainedSize(
+    { width: image.naturalWidth, height: image.naturalHeight },
+    { width: options.width, height: options.height },
+  );
+  if (drawn.width <= 0 || drawn.height <= 0) return;
+
   const offscreen = document.createElement('canvas');
-  offscreen.width = Math.max(1, Math.round(options.width));
-  offscreen.height = Math.max(1, Math.round(options.height));
+  offscreen.width = Math.max(1, Math.round(drawn.width));
+  offscreen.height = Math.max(1, Math.round(drawn.height));
   const offscreenContext = offscreen.getContext('2d');
   if (!offscreenContext) return;
 
@@ -87,10 +96,10 @@ function drawTintedSvgIcon(
 
   context.drawImage(
     offscreen,
-    options.centerX - options.width / 2,
-    options.centerY - options.height / 2,
-    options.width,
-    options.height,
+    options.centerX - drawn.width / 2,
+    options.centerY - drawn.height / 2,
+    drawn.width,
+    drawn.height,
   );
 }
 
@@ -276,24 +285,24 @@ export function useVideoExportRecorder() {
   const frameRequestRef = useRef<number | null>(null);
   const frameCleanupRef = useRef<(() => void) | null>(null);
   const cachedLogoRef = useRef<HTMLImageElement | null>(null);
-  const svgMarkerImageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const pendingSvgMarkerLoadsRef = useRef<Set<string>>(new Set());
+  const markerIconImageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const pendingMarkerIconLoadsRef = useRef<Set<string>>(new Set());
 
-  const preloadSvgMarkerIcon = useCallback((url: string) => {
-    if (!url || svgMarkerImageCacheRef.current.has(url) || pendingSvgMarkerLoadsRef.current.has(url)) {
+  const preloadMarkerIcon = useCallback((url: string) => {
+    if (!url || markerIconImageCacheRef.current.has(url) || pendingMarkerIconLoadsRef.current.has(url)) {
       return;
     }
 
-    pendingSvgMarkerLoadsRef.current.add(url);
+    pendingMarkerIconLoadsRef.current.add(url);
     const image = new Image();
     image.crossOrigin = 'anonymous';
     image.decoding = 'async';
     image.onload = () => {
-      svgMarkerImageCacheRef.current.set(url, image);
-      pendingSvgMarkerLoadsRef.current.delete(url);
+      markerIconImageCacheRef.current.set(url, image);
+      pendingMarkerIconLoadsRef.current.delete(url);
     };
     image.onerror = () => {
-      pendingSvgMarkerLoadsRef.current.delete(url);
+      pendingMarkerIconLoadsRef.current.delete(url);
     };
     image.src = url;
   }, []);
@@ -303,13 +312,13 @@ export function useVideoExportRecorder() {
     tracks.forEach((track) => iconValues.add(track.activityIcon));
 
     iconValues.forEach((iconValue) => {
-      if (!isSvgActivityIcon(iconValue)) return;
-      const svgIconUrl = getActivityIconOption(iconValue)?.content;
-      if (svgIconUrl) {
-        preloadSvgMarkerIcon(svgIconUrl);
-      }
+      const icon = getActivityIconOption(iconValue);
+      // Both SVG (mask-image) and PNG (<img>) markers are redrawn onto the
+      // recording canvas by hand, so both need their bitmap decoded up front.
+      if (icon?.kind !== 'svg' && icon?.kind !== 'png') return;
+      preloadMarkerIcon(icon.content);
     });
-  }, [preloadSvgMarkerIcon, tracks, trailStyle.currentIcon]);
+  }, [preloadMarkerIcon, tracks, trailStyle.currentIcon]);
 
   const captureFrame = useCallback(() => {
     if (!recordingCanvasRef.current || !recordingContextRef.current) return;
@@ -434,9 +443,13 @@ export function useVideoExportRecorder() {
         const markerIconHeight = parseFloat(markerIcon.style.height || '24') * scaleY;
         const maskImage = markerIcon.style.maskImage || markerIcon.style.webkitMaskImage || '';
         const maskUrl = extractCssUrl(maskImage);
+        // PNG activity icons render as a plain <img> inside the marker span,
+        // with no mask and no text, so they need their own branch here or they
+        // are simply never painted into the video.
+        const pngImage = maskUrl ? null : markerIcon.querySelector('img') as HTMLImageElement | null;
 
         if (maskUrl) {
-          const markerSvg = svgMarkerImageCacheRef.current.get(maskUrl);
+          const markerSvg = markerIconImageCacheRef.current.get(maskUrl);
           if (markerSvg) {
             drawTintedSvgIcon(context, markerSvg, {
               centerX: markerX,
@@ -446,7 +459,35 @@ export function useVideoExportRecorder() {
               height: markerIconHeight,
             });
           } else {
-            preloadSvgMarkerIcon(maskUrl);
+            preloadMarkerIcon(maskUrl);
+          }
+        } else if (pngImage) {
+          const pngSource = pngImage.getAttribute('src') ?? '';
+          // The live marker's own <img> is already decoded; the cache only
+          // covers the case where this frame lands before that first decode.
+          const pngBitmap = pngImage.complete && pngImage.naturalWidth > 0
+            ? pngImage
+            : markerIconImageCacheRef.current.get(pngSource);
+
+          if (pngBitmap) {
+            // The DOM marker letterboxes the artwork with `object-fit: contain`
+            // inside a square box, so filling that box here instead would
+            // stretch any icon that isn't square.
+            const drawn = getContainedSize(
+              { width: pngBitmap.naturalWidth, height: pngBitmap.naturalHeight },
+              { width: markerIconWidth, height: markerIconHeight },
+            );
+            // Drawn untinted: unlike the monochrome SVG glyphs, these are
+            // full-color artwork and must keep their own pixels.
+            context.drawImage(
+              pngBitmap,
+              markerX - drawn.width / 2,
+              markerY - drawn.height / 2,
+              drawn.width,
+              drawn.height,
+            );
+          } else {
+            preloadMarkerIcon(pngSource);
           }
         } else if (markerIcon.textContent) {
           const fontSize = Math.round(parseFloat(markerIcon.style.fontSize || '24') * scaleX);
@@ -497,7 +538,7 @@ export function useVideoExportRecorder() {
     if (Date.now() - overlayLastUpdateRef.current >= overlayRefreshIntervalMs && !overlayBusyRef.current) {
       updateOverlayAsync(recordW, recordH);
     }
-  }, [cachedOverlayRef, drawElevationProgress, drawStatsValues, getTrackLabel, overlayBusyRef, overlayLastUpdateRef, overlayRefreshIntervalMs, preloadSvgMarkerIcon, updateOverlayAsync, videoExportSettings.resolution]);
+  }, [cachedOverlayRef, drawElevationProgress, drawStatsValues, getTrackLabel, overlayBusyRef, overlayLastUpdateRef, overlayRefreshIntervalMs, preloadMarkerIcon, updateOverlayAsync, videoExportSettings.resolution]);
 
   // When encoding via WebCodecs, push the freshly drawn canvas to the encoder.
   // No-op for the MediaRecorder path, which samples the canvas stream itself.

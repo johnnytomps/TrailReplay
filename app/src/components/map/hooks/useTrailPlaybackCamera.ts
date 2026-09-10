@@ -119,6 +119,28 @@ export function resolvePlaybackMarkerColor(
     : configuredMarkerColor;
 }
 
+// Gap left between the icon's outermost corner and the glow ring, at
+// `markerSize` 1. Small enough to read as a ring around the icon rather than a
+// bubble containing it.
+export const PLAYBACK_MARKER_CIRCLE_GAP = 3;
+
+const PLAYBACK_MARKER_ICON_BASE_SIZE = 60;
+
+/**
+ * The icon is letterboxed into a square box, so its furthest pixel from the
+ * marker centre is a corner of that box, not its edge. Sizing the circle to the
+ * box's *diagonal* is therefore what keeps artwork of any aspect ratio inside
+ * the ring; matching the box's width lets wide icons poke out the sides.
+ */
+export function getPlaybackMarkerGeometry(markerSize: number): { circleSize: number; iconSize: number } {
+  const iconSize = Math.round(PLAYBACK_MARKER_ICON_BASE_SIZE * markerSize);
+  const gap = PLAYBACK_MARKER_CIRCLE_GAP * markerSize;
+  return {
+    circleSize: Math.round((iconSize * Math.SQRT2) + (gap * 2)),
+    iconSize,
+  };
+}
+
 export function updatePlaybackMarkerElement(
   element: HTMLElement,
   markerHtml: string,
@@ -221,10 +243,9 @@ export function useTrailPlaybackCamera({
           flex-shrink: 0;
         "></div>`;
       } else if (trailStyle.showMarker) {
-        const fontSize = Math.round(28 * trailStyle.markerSize);
-        const circleSize = Math.round(40 * trailStyle.markerSize);
+        const { circleSize, iconSize } = getPlaybackMarkerGeometry(trailStyle.markerSize);
         const iconColor = isSvgActivityIcon(icon) ? markerColor : currentColor;
-        const iconHtml = getActivityIconMarkerHtml(icon, fontSize, iconColor);
+        const iconHtml = getActivityIconMarkerHtml(icon, iconSize, iconColor);
         const glowBackground = isSvgActivityIcon(icon) ? 'rgba(22, 32, 40, 0.72)' : `${markerColor}40`;
         markerHtml = `
           ${trailStyle.showCircle ? `<div style="
